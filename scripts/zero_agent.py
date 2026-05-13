@@ -52,12 +52,20 @@ def main():
     print(f"[INFO]: Gym action space: {env.action_space}")
     # reset environment
     env.reset()
+    hold_action = None
+    if args_cli.task and "So101Bench" in args_cli.task:
+        hold_action = torch.tensor(
+            [-0.253998, -1.429948, 0.785040, 1.312357, -0.094108, -0.150151],
+            device=env.unwrapped.device,
+        )
     # simulate environment
     while simulation_app.is_running():
         # run everything in inference mode
         with torch.inference_mode():
             # compute zero actions
             actions = torch.zeros(env.action_space.shape, device=env.unwrapped.device)
+            if hold_action is not None:
+                actions[:] = hold_action
             # apply actions
             env.step(actions)
 

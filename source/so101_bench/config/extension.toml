@@ -7,12 +7,12 @@ version = "0.1.0"
 category = "isaaclab"
 readme  = "README.md"
 
-title = "Extension Template"
-author = "Isaac Lab Project Developers"
-maintainer = "Isaac Lab Project Developers"
-description="Extension Template for Isaac Lab"
-repository = "https://github.com/isaac-sim/IsaacLab.git"
-keywords = ["extension", "template", "isaaclab"]
+title = "SO-101 Bench"
+author = "Truman Hickok"
+maintainer = "Truman Hickok"
+description="Isaac Lab environment for SO-101 Bench tabletop manipulation and GR00T evaluation"
+repository = ""
+keywords = ["so101", "isaaclab", "groot", "vla", "manipulation", "benchmark"]
 
 [dependencies]
 "isaaclab" = {}

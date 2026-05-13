@@ -1,27 +1,25 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
-# All rights reserved.
-#
-# SPDX-License-Identifier: BSD-3-Clause
+"""Gym registrations for SO-101 Bench environments."""
 
 import gymnasium as gym
 
-from . import agents
-
-##
-# Register Gym environments.
-##
+_ENTRY_POINT = "isaaclab.envs:ManagerBasedRLEnv"
+_CFG_MODULE = f"{__name__}.so101_bench_env_cfg"
 
 
-gym.register(
-    id="Template-So101-Bench-Direct-v0",
-    entry_point=f"{__name__}.so101_bench_env:So101BenchEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.so101_bench_env_cfg:So101BenchEnvCfg",
-        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg.yaml",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        "skrl_amp_cfg_entry_point": f"{agents.__name__}:skrl_amp_cfg.yaml",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
-        "sb3_cfg_entry_point": f"{agents.__name__}:sb3_ppo_cfg.yaml",
-    },
-)
+def _register(task_id: str, cfg_name: str):
+    gym.register(
+        id=task_id,
+        entry_point=_ENTRY_POINT,
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{_CFG_MODULE}:{cfg_name}",
+        },
+    )
+
+
+_register("So101Bench-Mixed-v0", "So101BenchEnvCfg")
+_register("So101Bench-Bin-v0", "So101BenchBinEnvCfg")
+_register("So101Bench-NextTo-v0", "So101BenchNextToEnvCfg")
+_register("So101Bench-Between-v0", "So101BenchBetweenEnvCfg")
+_register("So101Bench-Move-v0", "So101BenchMoveEnvCfg")
+
