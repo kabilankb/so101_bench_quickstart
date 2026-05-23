@@ -6,44 +6,28 @@ an orange SO-101 arm, a constant plastic bin, one to four tabletop objects, wris
 and overhead RGB-D cameras, and the four benchmark task families from the paper:
 
 - `So101Bench-Bin-v0`: place each object, or the single object, in the plastic bin.
+- `So101Bench-Bin-SingleObject-v0`: bin task with exactly one randomly selected object slot active on the table.
+- `So101Bench-Bin-Object1-v0` through `So101Bench-Bin-Object4-v0`: bin task with a specific object slot active.
 - `So101Bench-NextTo-v0`: place one object next to another.
 - `So101Bench-Between-v0`: place one object between two referents.
 - `So101Bench-Move-v0`: move one object in a commanded direction.
 - `So101Bench-Mixed-v0`: sample among all four families.
 
-The environment currently includes procedural proxy objects and a procedural
-fallback tabletop so it can boot before your scanned assets are wired in.
+The environment uses local USD assets for the bedroom tabletop, plastic bin, and
+tabletop objects.
 
 ## Required Local Asset Path
 
 The bundled scan at
 `source/so101_bench/so101_bench/assets/usd/room_scan.usdc` is used by default
-when present. Set this only if you want to use a different bedroom/tabletop USD:
+when present. To use a different bedroom/tabletop USD, update
+`BEDROOM_TABLETOP_USD` in
+`source/so101_bench/so101_bench/tasks/direct/so101_bench/so101_bench_env_cfg.py`.
 
-```bash
-export SO101_BENCH_BEDROOM_TABLETOP_USD="/absolute/path/to/your/bedroom_tabletop.usd"
-```
-
-For the bundled scan, `room_scan/collision_plane/collision_plane` is treated as
-the only collidable tabletop mesh and the scanned room mesh is visual-only. The
-sim uses the collision plane bounds to scale the scan so the tabletop's short
-side is 20 inches in the real world. Override that calibration value, or the
-tabletop surface height, if needed:
-
-```bash
-export SO101_BENCH_TABLETOP_SHORT_SIDE_IN="20"
-```
-
-If only one descendant prim in the scan should collide, set its path relative to
-`/BedroomTabletop`. This disables collision on other mesh descendants and enables
-it on the selected prim:
-
-```bash
-export SO101_BENCH_TABLETOP_COLLISION_PRIM="room_scan/collision_plane/collision_plane"
-```
-
-If `SO101_BENCH_BEDROOM_TABLETOP_USD` is not set, the environment uses a simple
-kinematic cuboid tabletop at the same height.
+For the bundled scan, `collision_mesh/Plane_002` is treated as the collidable
+tabletop mesh, while `table_visual` and `room` remain visual-only. The scan is
+authored at real-world scale, with the tabletop origin centered on the tabletop
+surface, so the environment loads it with identity scale and rotation.
 
 ## Install
 
@@ -73,6 +57,15 @@ Run the environment with a zero-action debug agent:
 /home/truman/IsaacLab/isaaclab.sh -p scripts/zero_agent.py --task So101Bench-Bin-v0 --enable_cameras
 ```
 
+Inspect the first JSONL episode without stepping physics:
+
+```bash
+/home/truman/IsaacLab/isaaclab.sh -p scripts/groot_eval.py \
+  --task So101Bench-Bin-v0 \
+  --episodes_jsonl tasks/real_gr00t_seen_1obj_WM.jsonl \
+  --inspect_initial_scene
+```
+
 ## GR00T Remote Inference
 
 Start your GR00T-N1.6 fine-tuned policy server separately, then run:
@@ -80,9 +73,31 @@ Start your GR00T-N1.6 fine-tuned policy server separately, then run:
 ```bash
 /home/truman/IsaacLab/isaaclab.sh -p scripts/groot_eval.py \
   --task So101Bench-Bin-v0 \
+  --episodes_jsonl tasks/real_gr00t_seen_1obj_WM.jsonl \
   --policy_host localhost \
-  --policy_port 5555 \
-  --num_episodes 10
+  --policy_port 5555
+```
+
+`--episodes_jsonl` is required by `scripts/groot_eval.py`. It drives the
+episode objects and instruction from each JSONL row. Every object name is
+validated against `OBJECT_SPLITS` in
+`so101_bench/benchmark.py` before evaluation. Object labels map to local USD
+filenames by replacing spaces with underscores, so `"green shoes"` selects
+`assets/usd/objects/green_shoes.usdc`. Slots whose object USDs contain multiple
+rigid bodies are spawned as `AssetBaseCfg`; single-rigid-body objects use
+`RigidObjectCfg`.
+
+By default the evaluator runs every validated JSONL row. Use
+`--num_episodes 10` to evaluate only the first 10 rows.
+
+Rows must provide `objects` and `instruction`. The instruction must be one of
+the four benchmark forms:
+
+```json
+{"objects": ["grey wires"], "instruction": "Place each object in the plastic bin"}
+{"objects": ["black glasses", "silver glasses", "yellow toy car", "cardboard box"], "instruction": "Place the yellow toy car next to the silver glasses."}
+{"objects": ["black glasses", "silver glasses", "yellow toy car", "cardboard box"], "instruction": "Place the cardboard box between the black glasses and the yellow toy car."}
+{"objects": ["black glasses", "silver glasses", "yellow toy car", "cardboard box"], "instruction": "Move the cardboard box forwards."}
 ```
 
 For WM-conditioned checkpoints that expect the real-robot `overhead_init`
@@ -93,19 +108,21 @@ starts querying GR00T:
 ```bash
 /home/truman/IsaacLab/isaaclab.sh -p scripts/groot_eval.py \
   --task So101Bench-Bin-v0 \
+  --episodes_jsonl tasks/real_gr00t_seen_1obj_WM.jsonl \
   --policy_host localhost \
   --policy_port 5555 \
   --action_horizon 16 \
   --use_overhead_init true
 ```
 
-By default, the script uses the generated instruction from each environment
-reset. To force a fixed instruction:
+By default, the script sends the current JSONL row instruction to the policy.
+To override only the policy language, pass a matching fixed instruction:
 
 ```bash
 /home/truman/IsaacLab/isaaclab.sh -p scripts/groot_eval.py \
-  --task So101Bench-NextTo-v0 \
-  --lang_instruction "Place the blue bowl next to the black pen."
+  --task So101Bench-Bin-v0 \
+  --episodes_jsonl tasks/real_gr00t_seen_1obj_WM.jsonl \
+  --lang_instruction "Place each object in the plastic bin."
 ```
 
 The sim camera names are `wrist` and `overhead`. The evaluator sends the wrist
@@ -141,11 +158,15 @@ INNOMAKER_WRIST_CAMERA_RPY_DEG = (-45.0, 0.0, 0.0)
 
 The simulator includes automatic checks for the measurable rules in the paper:
 
-- maximum of three grasp attempts;
+- maximum of three grasp attempts per target object;
 - plastic bin displaced by more than 1 inch;
-- non-target object displaced by more than 0.25 inches;
+- non-target object displaced by more than 0.5 inches;
 - move-task boundary object displaced by more than 0.5 inches;
-- bin, next-to, between, and move success geometry with 2-inch tolerances.
+- all active-object containment for bin placement;
+- closest-surface and no-on-top checks for next-to placement;
+- the between-task 1.5-inch COM-to-line rule plus centering and no-on-top checks;
+- directional move boundaries selected from the nearest table edge, bin, or
+  blocking object, with straightness, no-crossing, and no-on-top checks.
 
 Qualitative appendix labels such as semantic error, bad grasp strategy,
 occlusion-induced grasp failure, and failed reorientation remain annotation
@@ -154,11 +175,10 @@ reliably inferred from geometry alone.
 
 ## Files To Customize Next
 
-- Bedroom/tabletop USD path: `SO101_BENCH_BEDROOM_TABLETOP_USD`
-- Tabletop collision subtree: `SO101_BENCH_TABLETOP_COLLISION_PRIM`
-- Real object mesh replacement: replace the four `object_*` proxy assets in
-  `source/so101_bench/so101_bench/tasks/direct/so101_bench/so101_bench_env_cfg.py`
-  or add your object USD registry there.
+- Bedroom/tabletop USD path: `BEDROOM_TABLETOP_USD` in `so101_bench_env_cfg.py`
+- Tabletop collision subtree: `BEDROOM_TABLETOP_COLLISION_PRIM` in `so101_bench_env_cfg.py`
+- Real object mesh registry: `OBJECT_SPLITS` in `so101_bench/benchmark.py`
+  plus matching USD files in `source/so101_bench/so101_bench/assets/usd/objects`.
 - Camera key mapping for your GR00T fine-tune: `--rename_map` in
   `scripts/groot_eval.py`
 - Wrist camera match to your real setup: `INNOMAKER_WRIST_CAMERA_HORIZONTAL_FOV_DEG`,
@@ -171,7 +191,7 @@ python gr00t/eval/run_gr00t_server.py   --model-path ~/workspace/so101_GR00T-N1.
 
 gsettings set org.gnome.mutter check-alive-timeout 0
 
-/home/truman/IsaacLab/isaaclab.sh -p scripts/groot_eval.py   --task So101Bench-Bin-v0   --policy_host localhost   --policy_port 5555   --action_horizon 16   --use_overhead_init true
+/home/truman/IsaacLab/isaaclab.sh -p scripts/groot_eval.py   --task So101Bench-Bin-v0   --episodes_jsonl tasks/real_gr00t_seen_1obj_WM.jsonl   --policy_host localhost   --policy_port 5555   --action_horizon 16   --use_overhead_init true
 
 /home/truman/IsaacLab/isaaclab.sh -p scripts/view_wrist_camera.py   --task So101Bench-Bin-v0   --display
 

@@ -6,13 +6,16 @@ import math
 import random
 
 import torch
-from pxr import Sdf, Usd, UsdGeom, UsdPhysics
+from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
+
+from isaacsim.core.simulation_manager import SimulationManager
 
 import isaaclab.sim as sim_utils
 import isaaclab.utils.math as math_utils
 from isaaclab.assets import Articulation, DeformableObject, RigidObject
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sim import get_current_stage
+from isaaclab.sim.views import XformPrimView
 
 from so101_bench.benchmark import (
     DIRECTIONS,
@@ -23,6 +26,7 @@ from so101_bench.benchmark import (
     TASK_MIXED,
     TASK_MOVE,
     TASK_NEXT_TO,
+    object_rigid_body_child_names,
     task_instruction,
 )
 
@@ -53,8 +57,231 @@ def _env_ids_tensor(env, env_ids: torch.Tensor | None) -> torch.Tensor:
     return env_ids.to(dtype=torch.long)
 
 
-def _object_positions(env, object_asset_names: list[str]) -> torch.Tensor:
-    return torch.stack([env.scene[name].data.root_pos_w for name in object_asset_names], dim=1)
+BenchmarkObject = RigidObject | Articulation | DeformableObject | XformPrimView
+BinPose = tuple[tuple[float, float, float], tuple[float, float, float]]
+DEFAULT_HALF_EXTENTS = (0.02, 0.02, 0.02)
+
+
+def benchmark_object_positions(env, object_asset_names: list[str]) -> torch.Tensor:
+    positions = []
+    multi_info = getattr(env, "_so101_multi_rigid_body_info", {}) or {}
+    for name in object_asset_names:
+        asset = env.scene[name]
+        if isinstance(asset, XformPrimView):
+            views = multi_info.get(name)
+            if views:
+                # Use the first inner rigid body's physics position; subtract its
+                # cached local offset to recover the wrapper-frame position.
+                view_info = views[0]
+                transforms = view_info["view"].get_transforms()
+                if not isinstance(transforms, torch.Tensor):
+                    transforms = torch.as_tensor(transforms)
+                transforms = transforms.to(env.device)
+                child_pos = transforms[..., :3]
+                child_quat_xyzw = transforms[..., 3:7]
+                child_quat_wxyz = math_utils.convert_quat(child_quat_xyzw, to="wxyz")
+                local_pos = view_info["local_pos"].to(env.device).expand_as(child_pos)
+                # wrapper_pos = child_pos - R(child_quat) * R(local_quat)^-1 * local_pos
+                # But child_quat = wrapper_quat * local_quat, so
+                # wrapper_quat = child_quat * local_quat^-1, and wrapper_pos = child_pos - R(wrapper_quat) * local_pos.
+                local_quat_inv = math_utils.quat_inv(
+                    view_info["local_quat"].to(env.device).expand_as(child_quat_wxyz)
+                )
+                wrapper_quat = math_utils.quat_mul(child_quat_wxyz, local_quat_inv)
+                wrapper_pos = child_pos - math_utils.quat_apply(wrapper_quat, local_pos)
+                positions.append(wrapper_pos)
+            else:
+                positions.append(asset.get_world_poses()[0])
+        else:
+            positions.append(asset.data.root_pos_w)
+    return torch.stack(positions, dim=1)
+
+
+def _prim_bbox_half_extents(stage: Usd.Stage, bbox_cache: UsdGeom.BBoxCache, prim_path: str) -> tuple[float, float, float]:
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim.IsValid():
+        return DEFAULT_HALF_EXTENTS
+
+    bbox_range = bbox_cache.ComputeWorldBound(prim).ComputeAlignedRange()
+    minimum = bbox_range.GetMin()
+    maximum = bbox_range.GetMax()
+    extents = tuple(max(0.5 * abs(float(maximum[i] - minimum[i])), 0.002) for i in range(3))
+    if not all(math.isfinite(extent) for extent in extents):
+        return DEFAULT_HALF_EXTENTS
+    return extents
+
+
+def _scene_half_extents(env, asset_name: str, bbox_cache: UsdGeom.BBoxCache, stage: Usd.Stage) -> torch.Tensor:
+    asset_cfg = getattr(env.scene.cfg, asset_name)
+    prim_paths = sim_utils.find_matching_prim_paths(asset_cfg.prim_path)
+    extents = [_prim_bbox_half_extents(stage, bbox_cache, prim_path) for prim_path in prim_paths]
+    if len(extents) != env.num_envs:
+        extents = [*extents[: env.num_envs], *[DEFAULT_HALF_EXTENTS] * max(0, env.num_envs - len(extents))]
+    return torch.tensor(extents, dtype=torch.float32, device=env.device)
+
+
+def _record_benchmark_geometry(
+    env,
+    object_asset_names: list[str],
+    bin_name: str,
+    object_labels: list[str] | None = None,
+) -> None:
+    """Cache per-slot AABB half-extents used by surface and containment checks."""
+
+    stage = get_current_stage()
+    bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_])
+    env._so101_object_half_extents = torch.stack(
+        [_scene_half_extents(env, asset_name, bbox_cache, stage) for asset_name in object_asset_names],
+        dim=1,
+    )
+    env._so101_bin_half_extents = _scene_half_extents(env, bin_name, bbox_cache, stage)
+    _ensure_multi_rigid_body_views(env, object_asset_names, object_labels)
+
+
+def _gf_quat_to_wxyz(quat: Gf.Quatd) -> tuple[float, float, float, float]:
+    imaginary = quat.GetImaginary()
+    return (
+        float(quat.GetReal()),
+        float(imaginary[0]),
+        float(imaginary[1]),
+        float(imaginary[2]),
+    )
+
+
+def _ensure_multi_rigid_body_views(
+    env,
+    object_asset_names: list[str],
+    object_labels: list[str] | None = None,
+) -> None:
+    """Discover inner rigid bodies and create PhysX views for multi-rigid-body assets.
+
+    Assets that wrap multiple PhysX rigid bodies (e.g., shoes loaded as
+    ``AssetBaseCfg``) cannot be teleported by writing the wrapper's xformOp,
+    because PhysX overwrites the USD xform each step. We instead teleport each
+    inner rigid body via a PhysX ``RigidBodyView`` so the layout pose is applied
+    to the actual physics state. This is done once and cached on ``env``.
+    """
+
+    if getattr(env, "_so101_multi_rigid_body_info_built", False):
+        return
+
+    info: dict[str, list[dict]] = {}
+    stage = get_current_stage()
+    xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+    physics_sim_view = SimulationManager.get_physics_sim_view()
+
+    for asset_id, asset_name in enumerate(object_asset_names):
+        asset = env.scene[asset_name]
+        if not isinstance(asset, XformPrimView):
+            continue
+        asset_cfg = getattr(env.scene.cfg, asset_name)
+        wrapper_prim_paths = sim_utils.find_matching_prim_paths(asset_cfg.prim_path)
+        if not wrapper_prim_paths:
+            continue
+        first_path = wrapper_prim_paths[0]
+        first_prim = stage.GetPrimAtPath(first_path)
+        if not first_prim.IsValid():
+            continue
+
+        wrapper_to_world = xform_cache.GetLocalToWorldTransform(first_prim)
+        wrapper_to_world.Orthonormalize()
+        wrapper_world_inv = wrapper_to_world.GetInverse()
+
+        object_label = (
+            object_labels[asset_id] if object_labels is not None and asset_id < len(object_labels) else ""
+        )
+        split_child_names = object_rigid_body_child_names(object_label) if object_label else ()
+        rigid_body_prims = []
+        for child_name in split_child_names:
+            child_prim = stage.GetPrimAtPath(f"{first_path}/{child_name}")
+            if child_prim.IsValid() and child_prim.HasAPI(UsdPhysics.RigidBodyAPI):
+                rigid_body_prims.append(child_prim)
+        if not rigid_body_prims:
+            rigid_body_prims = [
+                prim
+                for prim in Usd.PrimRange(first_prim)
+                if prim.HasAPI(UsdPhysics.RigidBodyAPI)
+                and (not split_child_names or prim.GetPath() != first_prim.GetPath())
+            ]
+
+        sub_records: list[dict] = []
+        for prim in rigid_body_prims:
+            body_path = prim.GetPath().pathString
+            rel_path = body_path[len(first_path):]
+            body_to_world = xform_cache.GetLocalToWorldTransform(prim)
+            body_to_world.Orthonormalize()
+            body_to_wrapper = body_to_world * wrapper_world_inv
+            local_pos = body_to_wrapper.ExtractTranslation()
+            local_quat = body_to_wrapper.ExtractRotationQuat()
+            sub_records.append(
+                {
+                    "rel_path": rel_path,
+                    "local_pos": (
+                        float(local_pos[0]),
+                        float(local_pos[1]),
+                        float(local_pos[2]),
+                    ),
+                    "local_quat_wxyz": _gf_quat_to_wxyz(local_quat),
+                }
+            )
+
+        if not sub_records:
+            continue
+
+        views: list[dict] = []
+        for record in sub_records:
+            pattern = asset_cfg.prim_path + record["rel_path"]
+            physx_pattern = pattern.replace(".*", "*")
+            view = physics_sim_view.create_rigid_body_view(physx_pattern)
+            views.append(
+                {
+                    "view": view,
+                    "local_pos": torch.tensor(record["local_pos"], dtype=torch.float32, device=env.device),
+                    "local_quat": torch.tensor(record["local_quat_wxyz"], dtype=torch.float32, device=env.device),
+                }
+            )
+        info[asset_name] = views
+
+    env._so101_multi_rigid_body_info = info
+    env._so101_multi_rigid_body_info_built = True
+
+
+def _write_multi_rigid_body_pose(
+    env,
+    asset_name: str,
+    env_id: int,
+    root_pos_w: torch.Tensor,
+    quat_wxyz: torch.Tensor,
+) -> bool:
+    """Teleport each inner rigid body of a multi-rigid-body asset to match the wrapper pose."""
+
+    info = getattr(env, "_so101_multi_rigid_body_info", None)
+    if not info:
+        return False
+    views = info.get(asset_name)
+    if not views:
+        return False
+
+    device = root_pos_w.device
+    wrapper_pos = root_pos_w.unsqueeze(0)  # (1, 3)
+    wrapper_quat = quat_wxyz.unsqueeze(0)  # (1, 4) wxyz
+    indices = torch.tensor([env_id], dtype=torch.int32, device=device)
+
+    for view_info in views:
+        view = view_info["view"]
+        local_pos = view_info["local_pos"].to(device).unsqueeze(0)
+        local_quat = view_info["local_quat"].to(device).unsqueeze(0)
+        child_pos = wrapper_pos + math_utils.quat_apply(wrapper_quat, local_pos)
+        child_quat_wxyz = math_utils.quat_mul(wrapper_quat, local_quat)
+        child_quat_xyzw = math_utils.convert_quat(child_quat_wxyz, to="xyzw")
+
+        data = torch.zeros((view.count, 7), dtype=torch.float32, device=device)
+        data[env_id, :3] = child_pos[0]
+        data[env_id, 3:7] = child_quat_xyzw[0]
+        view.set_transforms(data, indices)
+        velocities = torch.zeros((view.count, 6), dtype=torch.float32, device=device)
+        view.set_velocities(velocities, indices)
+    return True
 
 
 def _ensure_robot_start_buffers(env) -> None:
@@ -93,7 +320,7 @@ def mark_benchmark_robot_start(
 
     baseline_env_ids = env_ids[~env._so101_failure_baseline_recorded[env_ids]]
     if baseline_env_ids.numel() > 0:
-        env._so101_failure_object_pos_w[baseline_env_ids] = _object_positions(env, object_asset_names)[
+        env._so101_failure_object_pos_w[baseline_env_ids] = benchmark_object_positions(env, object_asset_names)[
             baseline_env_ids
         ]
         env._so101_failure_bin_pos_w[baseline_env_ids] = env.scene[bin_name].data.root_pos_w[baseline_env_ids]
@@ -140,12 +367,46 @@ def _sample_task_family(task_family: str) -> str:
 
 def _required_object_count(task_family: str, object_count_range: tuple[int, int]) -> int:
     low, high = object_count_range
+    if task_family == TASK_BIN:
+        supported_bin_counts = [count for count in (1, 4) if low <= count <= high]
+        if not supported_bin_counts:
+            raise ValueError(f"Bin tasks need one or four active objects, got range {object_count_range}.")
+        return random.choice(supported_bin_counts)
     if task_family == TASK_NEXT_TO:
-        low = max(low, 2)
+        low = max(low, 4)
     elif task_family == TASK_BETWEEN:
-        low = max(low, 3)
+        low = max(low, 4)
     high = max(high, low)
     return random.randint(low, high)
+
+
+def _active_object_ids(
+    num_objects: int,
+    active_count: int,
+    selection: str,
+    fixed_active_object_ids: tuple[int, ...] | None = None,
+) -> list[int]:
+    if selection == "prefix":
+        return list(range(active_count))
+    if selection == "random":
+        return random.sample(range(num_objects), active_count)
+    if selection == "fixed":
+        if fixed_active_object_ids is None:
+            raise ValueError("fixed_active_object_ids must be set when active_object_selection='fixed'.")
+        if len(fixed_active_object_ids) != active_count:
+            raise ValueError(
+                f"Expected {active_count} fixed active object ids, got {len(fixed_active_object_ids)}."
+            )
+        active_ids = list(fixed_active_object_ids)
+        invalid_ids = [object_id for object_id in active_ids if object_id < 0 or object_id >= num_objects]
+        if invalid_ids:
+            raise ValueError(f"Fixed active object ids are out of range for {num_objects} objects: {invalid_ids}.")
+        if len(set(active_ids)) != len(active_ids):
+            raise ValueError(f"Fixed active object ids must be unique, got {active_ids}.")
+        return active_ids
+    raise ValueError(
+        f"Unknown active object selection mode: {selection!r}. Expected 'prefix', 'random', or 'fixed'."
+    )
 
 
 def _sample_positions(
@@ -167,11 +428,70 @@ def _sample_positions(
     return positions
 
 
-def _fixed_positions(
+def _point_in_xy_polygon(point: tuple[float, float], polygon: list[tuple[float, float]]) -> bool:
+    x, y = point
+    inside = False
+    j = len(polygon) - 1
+    for i, (xi, yi) in enumerate(polygon):
+        xj, yj = polygon[j]
+        intersects = (yi > y) != (yj > y)
+        if intersects:
+            x_on_edge = (xj - xi) * (y - yi) / (yj - yi) + xi
+            if x < x_on_edge:
+                inside = not inside
+        j = i
+    return inside
+
+
+def _sample_positions_in_polygon(
     count: int,
+    polygon_vertices: list[tuple[float, float, float]] | tuple[tuple[float, float, float], ...],
+    min_spacing: float,
+) -> list[tuple[float, float]]:
+    polygon = [(float(vertex[0]), float(vertex[1])) for vertex in polygon_vertices]
+    if len(polygon) < 3:
+        raise ValueError(f"Expected a spawn polygon with at least 3 vertices, got {polygon_vertices!r}.")
+
+    x_values = [point[0] for point in polygon]
+    y_values = [point[1] for point in polygon]
+    x_min, x_max = min(x_values), max(x_values)
+    y_min, y_max = min(y_values), max(y_values)
+    positions: list[tuple[float, float]] = []
+
+    for _ in range(count):
+        candidate = polygon[0]
+        fallback_candidate: tuple[float, float] | None = None
+        for _attempt in range(500):
+            candidate = (random.uniform(x_min, x_max), random.uniform(y_min, y_max))
+            if not _point_in_xy_polygon(candidate, polygon):
+                continue
+            fallback_candidate = candidate
+            if all(math.dist(candidate, existing) >= min_spacing for existing in positions):
+                break
+        else:
+            if fallback_candidate is None:
+                raise RuntimeError(f"Could not sample an object position inside spawn polygon {polygon_vertices!r}.")
+            candidate = fallback_candidate
+        positions.append(candidate)
+    return positions
+
+
+def _fixed_positions(
+    active_object_ids: list[int],
     object_fixed_poses: tuple[tuple[float, float, float], ...],
 ) -> list[tuple[float, float]]:
-    return [(pose[0], pose[1]) for pose in object_fixed_poses[:count]]
+    return [
+        (object_fixed_poses[object_id][0], object_fixed_poses[object_id][1])
+        for object_id in active_object_ids
+    ]
+
+
+def _inactive_position(
+    base_pos: tuple[float, float, float],
+    spacing: float,
+    object_id: int,
+) -> tuple[float, float, float]:
+    return (base_pos[0] + spacing * object_id, base_pos[1], base_pos[2])
 
 
 def _yaw_quat(yaw: float, device: str) -> torch.Tensor:
@@ -209,14 +529,22 @@ def _bin_quat(yaw: float, root_rotation: tuple[float, float, float], device: str
 
 def _write_pose(
     env,
-    asset: RigidObject | Articulation | DeformableObject,
+    asset: BenchmarkObject,
     env_id: int,
     pos: tuple[float, float, float],
     quat: torch.Tensor,
+    asset_name: str | None = None,
 ):
     env_ids = torch.tensor([env_id], dtype=torch.long, device=asset.device)
     root_pos_w = torch.tensor(pos, dtype=torch.float32, device=asset.device).unsqueeze(0)
     root_pos_w += env.scene.env_origins[env_ids]
+
+    if isinstance(asset, XformPrimView):
+        quat_w = quat.to(asset.device)
+        asset.set_world_poses(root_pos_w, quat_w.unsqueeze(0), indices=env_ids)
+        if asset_name is not None:
+            _write_multi_rigid_body_pose(env, asset_name, env_id, root_pos_w[0], quat_w)
+        return root_pos_w[0]
 
     if isinstance(asset, DeformableObject):
         nodal_state = asset.data.default_nodal_state_w[env_ids].clone()
@@ -239,10 +567,58 @@ def _write_pose(
     return root_pose[0, :3]
 
 
-def _default_root_z(asset: RigidObject | Articulation | DeformableObject, env_id: int) -> float:
+def _default_root_z(asset: BenchmarkObject, env_id: int) -> float:
+    if isinstance(asset, XformPrimView):
+        return float(asset.get_world_poses(indices=[env_id])[0][0, 2].item())
     if isinstance(asset, DeformableObject):
         return float(asset.data.default_nodal_state_w[env_id, :, 2].mean().item())
     return float(asset.data.default_root_state[env_id, 2].item())
+
+
+def _layout_object_entries(episode_layout: dict | None) -> dict[int, dict]:
+    if episode_layout is None:
+        return {}
+    entries: dict[int, dict] = {}
+    for entry in episode_layout.get("objects", []):
+        object_id = int(entry["slot"])
+        entries[object_id] = entry
+    return entries
+
+
+def _layout_object_position(entry: dict) -> tuple[float, float, float]:
+    position = entry.get("position")
+    if not isinstance(position, (list, tuple)) or len(position) < 3:
+        raise ValueError(f"Episode layout object entry is missing a 3D position: {entry!r}.")
+    return (float(position[0]), float(position[1]), float(position[2]))
+
+
+def _layout_object_yaw(entry: dict) -> float:
+    if "yaw" in entry:
+        return float(entry["yaw"])
+    rpy = entry.get("rpy")
+    if isinstance(rpy, (list, tuple)) and len(rpy) >= 3:
+        return float(rpy[2])
+    raise ValueError(f"Episode layout object entry is missing a yaw/rpy rotation: {entry!r}.")
+
+
+def _layout_bin_pose(
+    episode_layout: dict | None,
+) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
+    if episode_layout is None:
+        return None
+    bin_entry = episode_layout.get("bin")
+    if not isinstance(bin_entry, dict):
+        raise ValueError("Episode layout is missing a 'bin' pose entry.")
+    position = bin_entry.get("position")
+    rpy = bin_entry.get("rpy")
+    if not isinstance(position, (list, tuple)) or len(position) < 3:
+        raise ValueError(f"Episode layout bin entry is missing a 3D position: {bin_entry!r}.")
+    if not isinstance(rpy, (list, tuple)) or len(rpy) < 3:
+        raise ValueError(f"Episode layout bin entry is missing an RPY rotation: {bin_entry!r}.")
+    return (
+        (float(position[0]), float(position[1]), float(position[2])),
+        (float(rpy[0]), float(rpy[1]), float(rpy[2])),
+    )
 
 
 def reset_benchmark_scene(
@@ -260,16 +636,29 @@ def reset_benchmark_scene(
     bin_root_rotation: tuple[float, float, float] = (0.0, 0.0, 0.0),
     bin_z: float | None = None,
     object_fixed_poses: tuple[tuple[float, float, float], ...] | None = None,
-    randomize_bin_for_bin_task: bool = True,
-    bin_x_range: tuple[float, float] = (0.26, 0.43),
-    bin_y_range: tuple[float, float] = (-0.19, 0.19),
-    inactive_z: float = -0.35,
+    randomize_bin_for_bin_task: bool = False,
+    bin_random_poses: tuple[BinPose, ...] = (),
+    valid_spawn_regions: list[list[tuple[float, float, float]]] | None = None,
+    active_object_selection: str = "prefix",
+    fixed_active_object_ids: tuple[int, ...] | None = None,
+    shuffle_object_labels: bool = True,
+    force_bin_all_objects_instruction: bool = False,
+    episode_spec: dict | None = None,
+    episode_layout: dict | None = None,
+    inactive_object_base_pos: tuple[float, float, float] = (20.0, 20.0, -10.0),
+    inactive_object_spacing: float = 0.25,
 ):
-    """Randomize the benchmark task, plastic bin, and 1-4 tabletop objects.
+    """Reset the benchmark task, plastic bin, and 1-4 tabletop objects.
 
     The function stores per-episode metadata on the environment under
     ``so101_bench_instruction`` and private tensor buffers consumed by the
-    success/failure termination terms.
+    success/failure termination terms. By default active objects are the first
+    ``N`` object slots; ``active_object_selection="random"`` samples the active
+    slots from all configured objects, and ``active_object_selection="fixed"``
+    uses ``fixed_active_object_ids``. Random bin placement samples a full pose
+    from ``bin_random_poses`` instead of sampling a continuous position range.
+    When ``episode_layout`` is provided, the saved object and bin poses are
+    replayed exactly.
     """
 
     if table_bounds is None:
@@ -295,76 +684,155 @@ def reset_benchmark_scene(
     env._so101_robot_started_moving = torch.zeros(num_envs, dtype=torch.bool, device=device)
     env._so101_robot_start_step = torch.full((num_envs,), -1, dtype=torch.long, device=device)
     env._so101_robot_start_time_s = torch.full((num_envs,), float("nan"), dtype=torch.float32, device=device)
-    env._so101_grasp_attempt_count = torch.zeros(num_envs, dtype=torch.long, device=device)
+    env._so101_grasp_attempt_counts = torch.zeros((num_envs, num_objects), dtype=torch.long, device=device)
     env._so101_max_grasp_attempts = MAX_GRASP_ATTEMPTS
-    env._so101_prev_jaw_pos = None
-    env._so101_prev_ee_pos_w = None
-    env._so101_last_attempt_step = torch.full((num_envs,), -1, dtype=torch.long, device=device)
+    env._so101_grasp_armed = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    env._so101_grasp_arm_jaw_pos = None
     env._so101_bin_success_counter = torch.zeros(num_envs, dtype=torch.long, device=device)
     env._so101_next_to_success_counter = torch.zeros(num_envs, dtype=torch.long, device=device)
     env._so101_between_success_counter = torch.zeros(num_envs, dtype=torch.long, device=device)
     env._so101_move_success_counter = torch.zeros(num_envs, dtype=torch.long, device=device)
     env.so101_bench_episodes = []
+    for cache_name in ("_so101_move_boundary_coords", "_so101_move_boundary_ids"):
+        if hasattr(env, cache_name):
+            delattr(env, cache_name)
 
     bin_asset: RigidObject = env.scene[bin_name]
-    object_assets: list[RigidObject | DeformableObject] = [env.scene[name] for name in object_asset_names]
+    object_assets: list[BenchmarkObject] = [env.scene[name] for name in object_asset_names]
+    _record_benchmark_geometry(env, object_asset_names, bin_name, object_labels)
+    layout_objects = _layout_object_entries(episode_layout)
+    layout_bin_pose = _layout_bin_pose(episode_layout)
 
     for env_id_tensor in env_ids:
         env_id = int(env_id_tensor.item())
-        selected_task = _sample_task_family(task_family)
-        active_count = _required_object_count(selected_task, object_count_range)
-        active_count = min(active_count, num_objects)
-        if object_fixed_poses is not None:
-            if len(object_fixed_poses) < active_count:
+        if episode_spec is None:
+            selected_task = _sample_task_family(task_family)
+            active_count = _required_object_count(selected_task, object_count_range)
+            active_count = min(active_count, num_objects)
+            if active_count < 1:
+                raise ValueError(f"Expected at least one active object, got {active_count}.")
+            active_object_ids = _active_object_ids(
+                num_objects,
+                active_count,
+                active_object_selection,
+                fixed_active_object_ids=fixed_active_object_ids,
+            )
+        else:
+            selected_task = str(episode_spec["task_family"])
+            active_object_ids = [int(object_id) for object_id in episode_spec["active_object_ids"]]
+            active_count = len(active_object_ids)
+            if not active_object_ids:
+                raise ValueError("episode_spec must activate at least one object.")
+            invalid_ids = [object_id for object_id in active_object_ids if object_id < 0 or object_id >= num_objects]
+            if invalid_ids:
+                raise ValueError(f"episode_spec active object ids are out of range: {invalid_ids}.")
+        active_object_order = {object_id: order for order, object_id in enumerate(active_object_ids)}
+
+        bin_pos = (bin_fixed_pose[0], bin_fixed_pose[1], bin_z)
+        bin_quat = _bin_quat(bin_fixed_pose[2], bin_root_rotation, device)
+        selected_bin_pose_index: int | None = None
+        if layout_bin_pose is not None:
+            bin_pos, bin_rpy = layout_bin_pose
+            bin_quat = _rpy_quat(bin_rpy, device)
+            layout_bin_entry = episode_layout.get("bin") if isinstance(episode_layout, dict) else None
+            if isinstance(layout_bin_entry, dict) and "pose_index" in layout_bin_entry:
+                selected_bin_pose_index = int(layout_bin_entry["pose_index"])
+        elif selected_task == TASK_BIN and randomize_bin_for_bin_task and bin_random_poses:
+            selected_bin_pose_index = random.randrange(len(bin_random_poses))
+            bin_pos, bin_rpy = bin_random_poses[selected_bin_pose_index]
+            bin_quat = _rpy_quat(bin_rpy, device)
+
+        using_fixed_object_poses = False
+        if episode_layout is not None:
+            missing_layout_ids = [object_id for object_id in active_object_ids if object_id not in layout_objects]
+            if missing_layout_ids:
+                raise ValueError(f"Episode layout is missing active object slot(s): {missing_layout_ids}.")
+            sampled_positions = []
+        elif (
+            selected_task == TASK_BIN
+            and selected_bin_pose_index is not None
+            and valid_spawn_regions is not None
+        ):
+            if selected_bin_pose_index >= len(valid_spawn_regions):
                 raise ValueError(
-                    f"Need at least {active_count} fixed object poses, got {len(object_fixed_poses)}."
+                    f"Selected bin pose index {selected_bin_pose_index} but only "
+                    f"{len(valid_spawn_regions)} valid spawn region(s) are configured."
                 )
-            sampled_positions = _fixed_positions(active_count, object_fixed_poses)
+            sampled_positions = _sample_positions_in_polygon(
+                active_count,
+                valid_spawn_regions[selected_bin_pose_index],
+                min_object_spacing,
+            )
+        elif object_fixed_poses is not None:
+            required_pose_count = max(active_object_ids) + 1
+            if len(object_fixed_poses) < required_pose_count:
+                raise ValueError(
+                    f"Need at least {required_pose_count} fixed object poses, got {len(object_fixed_poses)}."
+                )
+            sampled_positions = _fixed_positions(active_object_ids, object_fixed_poses)
+            using_fixed_object_poses = True
         else:
             sampled_positions = _sample_positions(active_count, table_bounds, min_object_spacing)
 
-        label_perm = list(object_labels)
-        random.shuffle(label_perm)
-        active_labels = label_perm[:active_count]
-        direction = random.choice(DIRECTIONS)
+        if episode_spec is not None:
+            active_labels = [object_labels[object_id] for object_id in active_object_ids]
+            target_object_id = int(episode_spec["target_object_id"])
+            referents = [int(object_id) for object_id in episode_spec["referent_object_ids"]]
+            if len(referents) != 2:
+                raise ValueError(f"episode_spec must carry two referent ids, got {referents}.")
+            first_referent_id, second_referent_id = referents
+            direction = str(episode_spec.get("direction") or DIRECTIONS[0])
+        else:
+            if shuffle_object_labels:
+                label_perm = list(object_labels)
+                random.shuffle(label_perm)
+                active_labels = label_perm[:active_count]
+            else:
+                active_labels = [object_labels[object_id] for object_id in active_object_ids]
+            direction = random.choice(DIRECTIONS)
+            target_object_id = active_object_ids[0]
+            first_referent_id = active_object_ids[1] if active_count > 1 else target_object_id
+            if active_count > 2:
+                second_referent_id = active_object_ids[2]
+            elif active_count > 1:
+                second_referent_id = active_object_ids[1]
+            else:
+                second_referent_id = min(target_object_id + 1, num_objects - 1)
 
         env._so101_task_family[env_id] = selected_task
-        env._so101_active_object_mask[env_id, :active_count] = True
-        env._so101_target_object_ids[env_id] = 0
-        env._so101_referent_object_ids[env_id, 0] = 1 if active_count > 1 else 0
-        env._so101_referent_object_ids[env_id, 1] = 2 if active_count > 2 else 1
+        env._so101_active_object_mask[env_id, active_object_ids] = True
+        env._so101_target_object_ids[env_id] = target_object_id
+        env._so101_referent_object_ids[env_id, 0] = first_referent_id
+        env._so101_referent_object_ids[env_id, 1] = second_referent_id
         env._so101_direction_ids[env_id] = DIRECTIONS.index(direction)
-
-        if selected_task == TASK_BIN and randomize_bin_for_bin_task:
-            bin_x = random.uniform(*bin_x_range)
-            bin_y = random.uniform(*bin_y_range)
-            bin_yaw = random.uniform(-0.45, 0.45)
-        else:
-            bin_x, bin_y, bin_yaw = bin_fixed_pose
 
         env._so101_initial_bin_pos_w[env_id] = _write_pose(
             env,
             bin_asset,
             env_id,
-            (bin_x, bin_y, bin_z),
-            _bin_quat(bin_yaw, bin_root_rotation, device),
+            bin_pos,
+            bin_quat,
         )
         env._so101_failure_bin_pos_w[env_id] = env._so101_initial_bin_pos_w[env_id]
 
         for object_id, asset in enumerate(object_assets):
             default_z = _default_root_z(asset, env_id)
-            if object_id < active_count:
-                x, y = sampled_positions[object_id]
-                z = default_z if default_z > table_top_z else table_top_z + 0.025
-                yaw = (
-                    object_fixed_poses[object_id][2]
-                    if object_fixed_poses is not None
-                    else random.uniform(-math.pi, math.pi)
-                )
+            if object_id in active_object_order:
+                layout_entry = layout_objects.get(object_id)
+                if layout_entry is not None:
+                    x, y, z = _layout_object_position(layout_entry)
+                    yaw = _layout_object_yaw(layout_entry)
+                else:
+                    pose_id = active_object_order[object_id]
+                    x, y = sampled_positions[pose_id]
+                    z = default_z if default_z > table_top_z else table_top_z + 0.025
+                    yaw = (
+                        object_fixed_poses[object_id][2]
+                        if using_fixed_object_poses
+                        else random.uniform(-math.pi, math.pi)
+                    )
             else:
-                x = table_bounds["x"][0] - 0.35
-                y = table_bounds["y"][0] - 0.35 - 0.04 * object_id
-                z = inactive_z
+                x, y, z = _inactive_position(inactive_object_base_pos, inactive_object_spacing, object_id)
                 yaw = 0.0
 
             env._so101_initial_object_pos_w[env_id, object_id] = _write_pose(
@@ -373,12 +841,18 @@ def reset_benchmark_scene(
                 env_id,
                 (x, y, z),
                 _yaw_quat(yaw, device),
+                asset_name=object_asset_names[object_id],
             )
             env._so101_failure_object_pos_w[env_id, object_id] = env._so101_initial_object_pos_w[
                 env_id, object_id
             ]
 
-        instruction = task_instruction(selected_task, active_labels, direction)
+        if episode_spec is not None:
+            instruction = str(episode_spec["instruction"])
+        elif selected_task == TASK_BIN and force_bin_all_objects_instruction:
+            instruction = "Place each object in the plastic bin."
+        else:
+            instruction = task_instruction(selected_task, active_labels, direction)
         env._so101_instruction_text[env_id] = instruction
         env.so101_bench_episodes.append(
             {
@@ -386,8 +860,12 @@ def reset_benchmark_scene(
                 "task_family": selected_task,
                 "instruction": instruction,
                 "active_object_count": active_count,
+                "active_object_ids": active_object_ids,
+                "active_asset_names": [object_asset_names[object_id] for object_id in active_object_ids],
                 "active_labels": active_labels,
+                "bin_pose_index": selected_bin_pose_index,
                 "direction": direction if selected_task == TASK_MOVE else None,
+                "metadata": dict(episode_spec.get("metadata", {})) if episode_spec is not None else {},
             }
         )
 

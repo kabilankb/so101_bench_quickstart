@@ -75,5 +75,7 @@ tests/
 **/gelsight_r15_data/*
 
 paper.txt
+scratch.*
 **/assets/glb
 **/assets/usd
+tasks/layouts/*

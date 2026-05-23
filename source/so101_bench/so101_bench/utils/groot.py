@@ -18,6 +18,17 @@ import numpy as np
 import torch
 import zmq
 
+from so101_bench.utils.lerobot_calibration import (
+    LEROBOT_JOINT_FEATURE_ORDER,
+    LEROBOT_JOINT_ORDER,
+    REAL_SO101_CALIBRATION,
+    SIM_LIMIT_MARGIN_DEG,
+    STS3215_CENTER_POSITION,
+    STS3215_DEGREES_PER_TICK,
+    USD_SIM_JOINT_LIMITS_DEG,
+    lerobot_position_bounds,
+)
+
 
 def _to_json_serializable(obj: Any) -> Any:
     if is_dataclass(obj):
@@ -121,59 +132,85 @@ class PolicyClient:
 
 
 class SO101JointMapper:
-    """Convert between SO-101 USD radians and LeRobot/GR00T degree space."""
+    """Convert between SO-101 USD radians and calibrated LeRobot/GR00T `.pos` space."""
 
-    usd_mapping = {
-        "shoulder_pan": {"joint_min": -110.0, "joint_max": 110.0},
-        "shoulder_lift": {"joint_min": -100.0, "joint_max": 100.0},
-        "elbow_flex": {"joint_min": -100.0, "joint_max": 90.0},
-        "wrist_flex": {"joint_min": -95.0, "joint_max": 95.0},
-        "wrist_roll": {"joint_min": -160.0, "joint_max": 160.0},
-        "gripper": {"joint_min": -10.0, "joint_max": 100.0},
-    }
-
-    joint_order = [
-        "shoulder_pan.pos",
-        "shoulder_lift.pos",
-        "elbow_flex.pos",
-        "wrist_flex.pos",
-        "wrist_roll.pos",
-        "gripper.pos",
-    ]
+    joint_order = LEROBOT_JOINT_FEATURE_ORDER
 
     def __init__(self, device: str):
         self.device = device
-        self.joint_names = [joint.split(".")[0] for joint in self.joint_order]
-        self.joint_mins = torch.tensor(
-            [self.usd_mapping[name]["joint_min"] for name in self.joint_names],
+        self.joint_names = LEROBOT_JOINT_ORDER
+        self.lerobot_mins = torch.tensor(
+            [lerobot_position_bounds(name)[0] for name in self.joint_names],
             dtype=torch.float32,
             device=self.device,
         )
-        self.joint_maxs = torch.tensor(
-            [self.usd_mapping[name]["joint_max"] for name in self.joint_names],
+        self.lerobot_maxs = torch.tensor(
+            [lerobot_position_bounds(name)[1] for name in self.joint_names],
             dtype=torch.float32,
             device=self.device,
         )
+        self.calibration_mins = torch.tensor(
+            [REAL_SO101_CALIBRATION[name].range_min for name in self.joint_names],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.calibration_maxs = torch.tensor(
+            [REAL_SO101_CALIBRATION[name].range_max for name in self.joint_names],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.usd_mins_deg = torch.tensor(
+            [USD_SIM_JOINT_LIMITS_DEG[name][0] for name in self.joint_names],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.usd_maxs_deg = torch.tensor(
+            [USD_SIM_JOINT_LIMITS_DEG[name][1] for name in self.joint_names],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.is_gripper = torch.tensor([name == "gripper" for name in self.joint_names], device=self.device)
 
     def raw_action_tensor(self, real_action: dict[str, float]) -> torch.Tensor:
         return torch.tensor([real_action[joint] for joint in self.joint_order], dtype=torch.float32, device=self.device)
 
-    def sim_radians_to_raw_degrees(self, sim_values: torch.Tensor) -> torch.Tensor:
+    def sim_radians_to_lerobot_positions(self, sim_values: torch.Tensor) -> torch.Tensor:
         mapped_deg = sim_values * 180.0 / torch.pi
-        normalized = (mapped_deg - self.joint_mins) / (self.joint_maxs - self.joint_mins)
+        mapped_deg = torch.minimum(torch.maximum(mapped_deg, self.usd_mins_deg), self.usd_maxs_deg)
 
-        raw_degrees = torch.zeros_like(normalized)
-        raw_degrees[:-1] = normalized[:-1] * 200.0 - 100.0
-        raw_degrees[-1] = normalized[-1] * 100.0
-        return raw_degrees
+        motor_positions = mapped_deg / STS3215_DEGREES_PER_TICK + STS3215_CENTER_POSITION
+        body_normalized = (motor_positions - self.calibration_mins) / (
+            self.calibration_maxs - self.calibration_mins
+        )
+        body_positions = body_normalized * 200.0 - 100.0
+
+        gripper_normalized = (mapped_deg - self.usd_mins_deg) / (self.usd_maxs_deg - self.usd_mins_deg)
+        gripper_positions = gripper_normalized * 100.0
+
+        lerobot_positions = torch.where(self.is_gripper, gripper_positions, body_positions)
+        return torch.minimum(torch.maximum(lerobot_positions, self.lerobot_mins), self.lerobot_maxs)
+
+    def lerobot_positions_to_sim_radians(self, lerobot_positions: torch.Tensor) -> torch.Tensor:
+        bounded_positions = torch.minimum(torch.maximum(lerobot_positions, self.lerobot_mins), self.lerobot_maxs)
+        body_normalized = (bounded_positions + 100.0) / 200.0
+        gripper_normalized = bounded_positions / 100.0
+
+        motor_positions = body_normalized * (self.calibration_maxs - self.calibration_mins) + self.calibration_mins
+        body_degrees = (motor_positions - STS3215_CENTER_POSITION) * STS3215_DEGREES_PER_TICK
+        gripper_degrees = self.usd_mins_deg + gripper_normalized * (self.usd_maxs_deg - self.usd_mins_deg)
+
+        mapped_deg = torch.where(self.is_gripper, gripper_degrees, body_degrees)
+        mapped_deg = torch.minimum(
+            torch.maximum(mapped_deg, self.usd_mins_deg + SIM_LIMIT_MARGIN_DEG),
+            self.usd_maxs_deg - SIM_LIMIT_MARGIN_DEG,
+        )
+        return mapped_deg * torch.pi / 180.0
+
+    def sim_radians_to_raw_degrees(self, sim_values: torch.Tensor) -> torch.Tensor:
+        return self.sim_radians_to_lerobot_positions(sim_values)
 
     def raw_degrees_to_sim_radians(self, raw_values: torch.Tensor) -> torch.Tensor:
-        normalized = torch.zeros_like(raw_values)
-        normalized[:-1] = (raw_values[:-1] + 100.0) / 200.0
-        normalized[-1] = raw_values[-1] / 100.0
-
-        mapped_deg = self.joint_mins + normalized * (self.joint_maxs - self.joint_mins)
-        return mapped_deg * torch.pi / 180.0
+        return self.lerobot_positions_to_sim_radians(raw_values)
 
 
 class GR00TRemotePolicy:
@@ -215,8 +252,8 @@ class GR00TRemotePolicy:
             raise RuntimeError("Cannot connect to GR00T policy server.")
         print("[INFO]: Policy server connected.")
 
-    def reset(self, initial_visual_obs: dict | None = None):
-        if self.client is not None:
+    def reset(self, initial_visual_obs: dict | None = None, *, reset_remote: bool = True):
+        if reset_remote and self.client is not None:
             self.client.reset()
         self.action_queue.clear()
         self.overhead_init_image = None

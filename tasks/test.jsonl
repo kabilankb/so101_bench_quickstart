@@ -1,0 +1,7 @@
+{"objects": ["yellow screwdriver", "cardboard box", "green shoes", "black pen"], "ood_key": "seen", "trial_id": 0, "n_objects": 4, "instruction": "Place each object in the plastic bin"}
+{"objects": ["black glasses", "silver glasses", "yellow toy car", "cardboard box"], "instruction": "Place the yellow toy car next to the cardboard box", "ood_key": "seen", "trial_id": 1}
+{"objects": ["black glasses", "silver glasses", "yellow toy car", "cardboard box"], "instruction": "Place the yellow toy car between the cardboard box and the silver glasses", "ood_key": "seen", "trial_id": 2}
+{"objects": ["black glasses", "silver glasses", "yellow toy car", "cardboard box"], "instruction": "Move the cardboard box left", "ood_key": "seen", "trial_id": 3}
+{"objects": ["cooking spoon", "black shoes", "green shoes", "yellow wires"], "ood_key": "seen", "trial_id": 4, "n_objects": 4, "instruction": "Place each object in the plastic bin"}
+{"objects": ["silver glasses"], "ood_key": "seen", "trial_id": 5, "n_objects": 1, "instruction": "Place each object in the plastic bin"}
+{"objects": ["flower pot"], "ood_key": "seen", "trial_id": 6, "n_objects": 1, "instruction": "Place each object in the plastic bin"}

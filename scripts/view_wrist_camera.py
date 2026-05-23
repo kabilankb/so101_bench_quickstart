@@ -60,6 +60,8 @@ from isaaclab_tasks.utils import parse_env_cfg
 
 import so101_bench.tasks  # noqa: F401
 
+ACTION_JOINT_NAMES = ("Rotation", "Pitch", "Elbow", "Wrist_Pitch", "Wrist_Roll", "Jaw")
+
 
 def _to_uint8_rgb(image: torch.Tensor) -> np.ndarray:
     array = image.detach().cpu().numpy()
@@ -161,6 +163,12 @@ def _maybe_display(window_name: str, rgb: np.ndarray) -> bool:
         return False
 
 
+def _initial_robot_action(env) -> torch.Tensor:
+    robot = env.unwrapped.scene["robot"]
+    joint_ids = [robot.joint_names.index(joint_name) for joint_name in ACTION_JOINT_NAMES]
+    return robot.data.default_joint_pos[0, joint_ids].clone()
+
+
 def main() -> None:
     env_cfg = parse_env_cfg(
         args_cli.task,
@@ -181,10 +189,7 @@ def main() -> None:
         print("[INFO]: Saving/displaying raw camera frames without policy resizing.")
 
     camera_names = _camera_names(args_cli.camera)
-    hold_action = torch.tensor(
-        [-0.253998, -1.429948, 0.785040, 1.312357, -0.094108, -0.150151],
-        device=env.unwrapped.device,
-    )
+    hold_action = _initial_robot_action(env)
     actions = torch.zeros(env.action_space.shape, device=env.unwrapped.device)
     actions[:] = hold_action
 
