@@ -2,12 +2,19 @@
 
 **Measuring the Gap Between Semantic and Geometric Competence in Vision-Language-Action Models**
 
-![SO-101 Bench tasks in the real world](plots/cvpr_two_column_figure.png)
+![SO-101 Bench tasks, shown on the real robot in the original study](plots/cvpr_two_column_figure.png)
 
-SO-101 Bench is a compact real-world benchmark for language-conditioned tabletop
-manipulation with an [SO-101](https://github.com/TheRobotStudio/SO-ARM100) robot
-arm, plus an Isaac Lab digital twin of the same setup for scalable simulated
-evaluation and real-to-sim correspondence studies.
+This repository is the **Isaac Lab simulation environment** for SO-101 Bench — a
+digital twin of a language-conditioned tabletop manipulation setup with an
+[SO-101](https://github.com/TheRobotStudio/SO-ARM100) robot arm. It reconstructs the
+bedroom/tabletop scene, plastic bin, and household objects in simulation so the four
+benchmark tasks can be run, recorded, and scored without hardware.
+
+> The accompanying paper (`27_SO_101_Bench_Measuring_Obje (1).pdf`) reports a
+> **real-world** study on physical SO-101 hardware. Those real-robot experiments are
+> **not** part of this repository — the figure above and the results below are from
+> the paper, included here as background. What you can run here is the *simulated*
+> twin of that benchmark.
 
 This repository contains:
 
@@ -42,13 +49,18 @@ This repository contains:
 
 ## What the project set out to accomplish
 
-Vision-language-action (VLA) models have advanced quickly, but their real-world
-evaluation remains limited — especially for tasks that demand precise geometric
-reasoning and generalization to novel objects. SO-101 Bench is a small-hardware,
-high-diagnostic benchmark designed to probe exactly that frontier. It evaluates a
-fine-tuned **GR00T-N1.6-3B** policy on an SO-101 arm over four language-conditioned
-tasks and **56 household objects** split into seen / unseen-seen-class /
-unseen-unseen-class regimes.
+Vision-language-action (VLA) models have advanced quickly, but their evaluation
+remains limited — especially for tasks that demand precise geometric reasoning and
+generalization to novel objects. SO-101 Bench is a small-hardware, high-diagnostic
+benchmark designed to probe exactly that frontier, evaluating a fine-tuned
+**GR00T-N1.6-3B** policy over four language-conditioned tasks and **56 household
+objects** split into seen / unseen-seen-class / unseen-unseen-class regimes.
+
+The original study (in the paper) ran this on a physical SO-101 arm. **This
+repository is the Isaac Lab digital twin of that benchmark** — the same tasks,
+objects, and instructions, instantiated in simulation. The background below
+summarizes the benchmark design and the paper's real-world findings to motivate
+what the simulator reproduces.
 
 ### The four tasks
 
@@ -74,10 +86,12 @@ language grounding nontrivial.
   whose specific *instance* was not.
 - **Unseen / unseen class** — 15 entirely novel objects.
 
-### Headline findings
+### Headline findings (real-world, from the paper)
 
-The fine-tune is strong on familiar objects and simple settings, but degrades
-sharply under spatial constraints, multi-object scenes, and object novelty.
+In the paper's real-robot study, the fine-tune is strong on familiar objects and
+simple settings, but degrades sharply under spatial constraints, multi-object
+scenes, and object novelty. These numbers come from the physical benchmark, not from
+this simulator:
 
 | Task                  | Seen  | Unseen / seen class | Unseen / unseen class |
 |-----------------------|:-----:|:-------------------:|:---------------------:|
