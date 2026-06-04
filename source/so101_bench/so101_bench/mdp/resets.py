@@ -907,6 +907,9 @@ def reset_benchmark_scene(
     env._so101_grasp_attempt_counts = _reset_tensor_rows(
         env, "_so101_grasp_attempt_counts", (num_envs, num_objects), torch.long, env_ids, 0
     )
+    env._so101_max_object_lift = _reset_tensor_rows(
+        env, "_so101_max_object_lift", (num_envs, num_objects), torch.float32, env_ids, 0.0
+    )
     env._so101_max_grasp_attempts = MAX_GRASP_ATTEMPTS
     env._so101_grasp_armed = _reset_tensor_rows(
         env, "_so101_grasp_armed", (num_envs,), torch.bool, env_ids, False
@@ -930,6 +933,9 @@ def reset_benchmark_scene(
     )
     env._so101_move_success_counter = _reset_tensor_rows(
         env, "_so101_move_success_counter", (num_envs,), torch.long, env_ids, 0
+    )
+    env._so101_move_straightness_failure_counter = _reset_tensor_rows(
+        env, "_so101_move_straightness_failure_counter", (num_envs,), torch.long, env_ids, 0
     )
     env._so101_timeout_success_confirmation_active = _reset_tensor_rows(
         env, "_so101_timeout_success_confirmation_active", (num_envs,), torch.bool, env_ids, False

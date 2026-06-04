@@ -30,6 +30,9 @@ MAX_GRASP_ATTEMPTS = 3
 GRASP_ATTEMPT_OBJECT_DISTANCE_M = 4.0 * INCH
 BIN_DISPLACEMENT_LIMIT_M = 1.0 * INCH
 NON_TARGET_DISPLACEMENT_LIMIT_M = 0.5 * INCH
+# A non-bin object only counts as "lifted off the ground" for postmortem failure
+# classification once its root rises this far above its settled resting height.
+LIFT_OFF_GROUND_LIMIT_M = 0.5 * INCH
 BOUNDARY_DISPLACEMENT_LIMIT_M = 0.5 * INCH
 SPATIAL_SUCCESS_DISTANCE_M = 2.0 * INCH
 BETWEEN_LINE_TOLERANCE_M = 1.5 * INCH

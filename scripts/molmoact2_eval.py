@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from datetime import datetime
 import json
 import math
@@ -84,6 +85,22 @@ parser.add_argument(
     help="Continuously hold the robot at the initial joint pose without connecting to or querying MolmoAct2.",
 )
 parser.add_argument(
+    "--remote_reset_each_episode",
+    dest="remote_reset_each_episode",
+    action="store_true",
+    default=True,
+    help=(
+        "Request a remote policy reset before every new episode when the MolmoAct2 policy helper supports it. "
+        "Enabled by default to match the evaluator reset contract."
+    ),
+)
+parser.add_argument(
+    "--no_remote_reset_each_episode",
+    dest="remote_reset_each_episode",
+    action="store_false",
+    help="Only clear local cached actions between episodes; useful for debugging reset behavior.",
+)
+parser.add_argument(
     "--lang_instruction",
     type=str,
     default=None,
@@ -147,6 +164,12 @@ parser.add_argument(
         "Keyboard key in the Isaac window that saves the current images from all cameras. "
         "Use an empty string to disable."
     ),
+)
+parser.add_argument(
+    "--episode_skip_key",
+    type=str,
+    default="N",
+    help="Keyboard key in the Isaac window that skips to the next episode. Use an empty string to disable.",
 )
 parser.add_argument(
     "--camera_snapshot_dir",
@@ -296,6 +319,7 @@ from so101_bench.layouts import (
     normalize_layout_object_slots,
 )
 from so101_bench.mdp import benchmark_object_positions, mark_benchmark_robot_start
+from so101_bench.mdp.terminations import POSTMORTEM_FAILURE_TYPES, POSTMORTEM_NOT_APPLICABLE
 from so101_bench.tasks.direct.so101_bench.so101_bench_env_cfg import (
     ASSETS_PATH,
     BIN_RANDOM_POSES,
@@ -344,7 +368,7 @@ def _normalize_keyboard_key(key: str) -> str:
 def _matches_keyboard_key(event_name: str, key: str) -> bool:
     event_name = _normalize_keyboard_key(event_name)
     key = _normalize_keyboard_key(key)
-    return event_name in {key, f"KEY_{key}"}
+    return bool(key) and event_name in {key, f"KEY_{key}"}
 
 
 def _normalize_terminal_command(command: str) -> str:
@@ -358,11 +382,13 @@ class _RuntimeControls:
         self,
         snapshot_key: str,
         *,
+        skip_key: str,
         terminal_enabled: bool,
         snapshot_stdin_enabled: bool,
         debug: bool,
     ):
         self.snapshot_key = _normalize_keyboard_key(snapshot_key) if snapshot_key else ""
+        self.skip_key = _normalize_keyboard_key(skip_key) if skip_key else ""
         self.paused = False
         self._events: queue.SimpleQueue[str] = queue.SimpleQueue()
         self._input = None
@@ -373,7 +399,7 @@ class _RuntimeControls:
         self._terminal_enabled = terminal_enabled
         self._snapshot_stdin_enabled = snapshot_stdin_enabled
 
-        if self.snapshot_key:
+        if self.snapshot_key or self.skip_key:
             self._start_isaac_keyboard_listener()
         if terminal_enabled or snapshot_stdin_enabled:
             self._start_stdin_listener()
@@ -437,7 +463,7 @@ class _RuntimeControls:
 
             app_window = omni.appwindow.get_default_app_window()
             if app_window is None:
-                print("[WARN]: No Isaac app window found; camera snapshot keyboard shortcut is unavailable.")
+                print("[WARN]: No Isaac app window found; Isaac keyboard shortcuts are unavailable.")
                 return
 
             self._input = carb.input.acquire_input_interface()
@@ -447,9 +473,12 @@ class _RuntimeControls:
                 self._keyboard,
                 self._on_keyboard_event,
             )
-            print(f"[INFO]: Press '{self.snapshot_key}' in the Isaac window to save all current camera images.")
+            if self.snapshot_key:
+                print(f"[INFO]: Press '{self.snapshot_key}' in the Isaac window to save all current camera images.")
+            if self.skip_key:
+                print(f"[INFO]: Press '{self.skip_key}' in the Isaac window to skip to the next episode.")
         except Exception as exc:
-            print(f"[WARN]: Camera snapshot keyboard shortcut unavailable: {exc}")
+            print(f"[WARN]: Isaac keyboard shortcuts unavailable: {exc}")
 
     def _start_stdin_listener(self) -> None:
         if not sys.stdin or not sys.stdin.isatty():
@@ -485,6 +514,9 @@ class _RuntimeControls:
         if event.type == self._key_press_type and _matches_keyboard_key(event_name, self.snapshot_key):
             print(f"[INFO]: Camera snapshot key received from Isaac window: {event_name}")
             self._events.put("snapshot")
+        if event.type == self._key_press_type and _matches_keyboard_key(event_name, self.skip_key):
+            print(f"[INFO]: Episode skip key received from Isaac window: {event_name}")
+            self._events.put("skip_episode")
         return True
 
     def poll(self) -> tuple[int, bool]:
@@ -991,18 +1023,22 @@ def _restore_robot_initial_pose(env) -> None:
 
 
 def _reset_env(env) -> tuple[dict, dict]:
-    obs, info = env.reset()
-    _restore_robot_initial_pose(env)
-    unwrapped = env.unwrapped
-    unwrapped.scene.write_data_to_sim()
-    unwrapped.sim.forward()
-    num_rerenders = getattr(unwrapped.cfg, "num_rerenders_on_reset", 0)
-    if unwrapped.sim.has_rtx_sensors() and num_rerenders > 0:
-        for _ in range(num_rerenders):
-            unwrapped.sim.render()
-    obs = unwrapped.observation_manager.compute(update_history=True)
-    unwrapped.obs_buf = obs
-    return obs, info
+    # Episode transitions may be requested while action inference is active.
+    # Isaac Lab keeps mutable articulation buffers across resets, so ensure reset
+    # does not create inference tensors that a later reset cannot update.
+    with torch.inference_mode(False):
+        obs, info = env.reset()
+        _restore_robot_initial_pose(env)
+        unwrapped = env.unwrapped
+        unwrapped.scene.write_data_to_sim()
+        unwrapped.sim.forward()
+        num_rerenders = getattr(unwrapped.cfg, "num_rerenders_on_reset", 0)
+        if unwrapped.sim.has_rtx_sensors() and num_rerenders > 0:
+            for _ in range(num_rerenders):
+                unwrapped.sim.render()
+        obs = unwrapped.observation_manager.compute(update_history=True)
+        unwrapped.obs_buf = obs
+        return obs, info
 
 
 def _print_initial_scene(env, object_asset_names: list[str]) -> None:
@@ -1013,6 +1049,7 @@ def _print_initial_scene(env, object_asset_names: list[str]) -> None:
     reset_params = unwrapped.cfg.events.reset_benchmark_scene.params
     object_labels = reset_params.get("object_labels", OBJECT_LABELS)
     object_positions = benchmark_object_positions(unwrapped, object_asset_names)
+    multi_rigid_body_info = getattr(unwrapped, "_so101_multi_rigid_body_info", {}) or {}
     for object_id, asset_name in enumerate(object_asset_names):
         label = object_labels[object_id] if object_id < len(object_labels) else asset_name
         pos = object_positions[0, object_id].detach().cpu().tolist()
@@ -1022,6 +1059,20 @@ def _print_initial_scene(env, object_asset_names: list[str]) -> None:
             f"[INFO]: Initial {asset_name} / {label} ({state}): "
             f"x={pos[0]:.5f}, y={pos[1]:.5f}, z={pos[2]:.5f}"
         )
+        child_positions = []
+        for view_info in multi_rigid_body_info.get(asset_name, ()):
+            transforms = view_info["view"].get_transforms()
+            if not isinstance(transforms, torch.Tensor):
+                transforms = torch.as_tensor(transforms)
+            child_pos = transforms[0, :3].detach().cpu().tolist()
+            child_positions.append(child_pos)
+            print(
+                f"[INFO]: Initial {asset_name} child {view_info['rel_path']}: "
+                f"x={child_pos[0]:.5f}, y={child_pos[1]:.5f}, z={child_pos[2]:.5f}"
+            )
+        if len(child_positions) > 1:
+            separation = math.dist(child_positions[0], child_positions[1])
+            print(f"[INFO]: Initial {asset_name} child origin separation: {separation:.5f} m")
 
     bin_asset = unwrapped.scene["plastic_bin"]
     bin_pos = bin_asset.data.root_pos_w[0].detach().cpu().tolist()
@@ -1154,10 +1205,13 @@ def main():
     episodes = 0
     successes = 0
     skipped = 0
+    end_reason_counts: Counter[str] = Counter()
+    postmortem_failure_counts: Counter[str] = Counter()
     robot_control_started = False
     snapshot_index = 0
     runtime_controls = _RuntimeControls(
         args_cli.camera_snapshot_key,
+        skip_key=args_cli.episode_skip_key,
         terminal_enabled=args_cli.terminal_control_stdin,
         snapshot_stdin_enabled=args_cli.camera_snapshot_stdin,
         debug=args_cli.camera_snapshot_debug,
@@ -1187,6 +1241,24 @@ def main():
         evaluated = episodes - skipped
         rate = 100.0 * successes / max(evaluated, 1)
         print(f"[INFO]: Success Rate: {successes}/{evaluated} ({rate:.1f}%), skipped={skipped}")
+        if end_reason_counts:
+            breakdown = ", ".join(
+                f"{reason}={count}" for reason, count in sorted(end_reason_counts.items())
+            )
+            print(f"[INFO]: Episode end reasons: {breakdown}")
+        failures = evaluated - successes
+        if failures > 0:
+            ordered_types = [*POSTMORTEM_FAILURE_TYPES, POSTMORTEM_NOT_APPLICABLE]
+            parts = []
+            for failure_type in ordered_types:
+                count = postmortem_failure_counts.get(failure_type, 0)
+                if count > 0:
+                    parts.append(f"{failure_type}={count} ({100.0 * count / failures:.1f}%)")
+            for failure_type, count in sorted(postmortem_failure_counts.items()):
+                if failure_type not in ordered_types:
+                    parts.append(f"{failure_type}={count} ({100.0 * count / failures:.1f}%)")
+            breakdown = ", ".join(parts) if parts else "none"
+            print(f"[INFO]: Postmortem failure types ({failures} failed episode(s)): {breakdown}")
 
     def _cancel_recording() -> None:
         if recorder is not None:
@@ -1224,7 +1296,7 @@ def main():
         sim_speed_ui.reset()
         _print_episode_setup(env)
         policy.set_language_instruction(_instruction(env, args_cli.lang_instruction))
-        policy.reset()
+        policy.reset(reset_remote=args_cli.remote_reset_each_episode)
         print(f"[INFO]: Episode instruction: {policy.lang_instruction}")
         hold_action = _initial_robot_action(env)
         actions[:] = hold_action
@@ -1240,7 +1312,7 @@ def main():
                 _cancel_recording()
                 episodes += 1
                 skipped += 1
-                print(f"[INFO]: Episode {episodes}/{episode_count}: skipped by terminal command.")
+                print(f"[INFO]: Episode {episodes}/{episode_count}: skipped by control request.")
                 if episodes >= episode_count:
                     _print_final_score()
                     break
@@ -1253,60 +1325,89 @@ def main():
                 time.sleep(0.02)
                 continue
 
-            with torch.inference_mode():
-                if step < initial_hold_steps:
+            if step < initial_hold_steps:
+                actions[:] = hold_action
+            else:
+                if args_cli.hold_init:
+                    if not robot_control_started:
+                        policy.set_episode_initial_observation(obs["visual"])
+                        robot_control_started = True
                     actions[:] = hold_action
                 else:
-                    if args_cli.hold_init:
-                        if not robot_control_started:
-                            policy.set_episode_initial_observation(obs["visual"])
-                            robot_control_started = True
-                        actions[:] = hold_action
-                    else:
-                        if not robot_control_started:
-                            _begin_robot_control(env, policy, obs, object_asset_names)
-                            robot_control_started = True
+                    if not robot_control_started:
+                        _begin_robot_control(env, policy, obs, object_asset_names)
+                        robot_control_started = True
+                    with torch.inference_mode():
                         joint_positions = obs["policy"]["joint_pos_obs"][0].clone()
                         actions[:] = policy.get_action(joint_positions, obs["visual"])
 
-                obs, _rewards, terminated, truncated, info = env.step(actions)
-                step += 1
-                sim_speed_ui.add_step()
-                _push_recording_frame()
+            obs, _rewards, terminated, truncated, info = env.step(actions)
+            step += 1
+            sim_speed_ui.add_step()
+            _push_recording_frame()
 
-                skip_requested = _poll_runtime_controls()
-                if skip_requested:
-                    _cancel_recording()
-                    episodes += 1
-                    skipped += 1
-                    print(f"[INFO]: Episode {episodes}/{episode_count}: skipped by terminal command.")
-                    if episodes >= episode_count:
-                        _print_final_score()
-                        break
-                    _start_next_episode()
-                    continue
-
-                is_done = bool(terminated.any().item() or truncated.any().item())
-                if not is_done:
-                    continue
-
-                term_log = info.get("log", {})
-                is_success = bool(term_log.get("Episode_Termination/success", 0.0) > 0.0)
-                end_reason = _episode_end_reason(env, terminated, truncated, term_log)
-                _save_recording()
+            skip_requested = _poll_runtime_controls()
+            if skip_requested:
+                _cancel_recording()
                 episodes += 1
-                successes += int(is_success)
-                episode_duration_s = step * control_dt
-                print(
-                    f"[INFO]: Episode {episodes}/{episode_count}: success={is_success}, "
-                    f"reason={end_reason}, length={episode_duration_s:.2f}s"
-                )
-
+                skipped += 1
+                print(f"[INFO]: Episode {episodes}/{episode_count}: skipped by control request.")
                 if episodes >= episode_count:
                     _print_final_score()
                     break
-
                 _start_next_episode()
+                continue
+
+            is_done = bool(terminated.any().item() or truncated.any().item())
+            if not is_done:
+                continue
+
+            term_log = info.get("log", {})
+            is_success = bool(term_log.get("Episode_Termination/success", 0.0) > 0.0)
+            end_reason = _episode_end_reason(env, terminated, truncated, term_log)
+            failure_reasons = getattr(env.unwrapped, "_so101_failure_reasons", None)
+            live_failure_reason = failure_reasons[0] if failure_reasons else "none"
+            episodes += 1
+            successes += int(is_success)
+            end_reason_counts[end_reason] += 1
+            episode_duration_s = step * control_dt
+            message = (
+                f"[INFO]: Episode {episodes}/{episode_count}: success={is_success}, "
+                f"reason={end_reason}, length={episode_duration_s:.2f}s"
+            )
+            if not is_success:
+                # Read the classification stored by benchmark_failure on the terminating
+                # step: the env auto-resets inside env.step() and zeros the lift buffer,
+                # so recomputing here would always see a cleared episode.
+                diagnostics = getattr(env.unwrapped, "_so101_postmortem_failure_diagnostics", None)
+                postmortem = diagnostics[0] if diagnostics else None
+                if postmortem is not None and postmortem.failure_type != POSTMORTEM_NOT_APPLICABLE:
+                    postmortem_failure_counts[postmortem.failure_type] += 1
+                    threshold_in = postmortem.lift_threshold_m / INCH
+                    message += (
+                        f", failure_type={postmortem.failure_type}"
+                        f", live_failure_reason={live_failure_reason}"
+                        f" [target={postmortem.target_object}, "
+                        f"target_lift={postmortem.target_lift_m / INCH:.2f}in, "
+                        f"wrong_object={postmortem.lifted_wrong_object}, "
+                        f"max_distractor_lift={postmortem.max_non_target_lift_m / INCH:.2f}in, "
+                        f"lift_threshold={threshold_in:.2f}in]"
+                    )
+                elif postmortem is not None:
+                    postmortem_failure_counts[postmortem.failure_type] += 1
+                    message += f", live_failure_reason={live_failure_reason}"
+            print(message)
+
+            # Finalize the recording only after the per-episode result is logged: with
+            # --record_dataset the video encode can take minutes, and printing first keeps
+            # the success/failure line timely instead of buried behind the encoder output.
+            _save_recording()
+
+            if episodes >= episode_count:
+                _print_final_score()
+                break
+
+            _start_next_episode()
     finally:
         _cancel_recording()
         if recorder is not None:

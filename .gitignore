@@ -79,3 +79,5 @@ scratch.*
 **/assets/glb
 **/assets/usd
 tasks/layouts/*
+
+checkpoints/

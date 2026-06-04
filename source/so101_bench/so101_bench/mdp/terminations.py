@@ -18,6 +18,7 @@ from so101_bench.benchmark import (
     BOUNDARY_DISPLACEMENT_LIMIT_M,
     DIRECTIONS,
     GRASP_ATTEMPT_OBJECT_DISTANCE_M,
+    LIFT_OFF_GROUND_LIMIT_M,
     MOVE_BOUNDARY_MIN_LATERAL_OVERLAP_FRACTION,
     MOVE_BOUNDARY_SUCCESS_DISTANCE_M,
     MOVE_NO_BOUNDARY_MIN_PROGRESS_M,
@@ -43,8 +44,22 @@ FAILURE_REASON_MOVE_TRAJECTORY_NOT_STRAIGHT_ENOUGH = "move_trajectory_not_straig
 FAILURE_REASON_MADE_CONTACT = "made_contact"
 FAILURE_REASON_SUCCESS_CONFIRMATION_BREACHED = "success_confirmation_breached"
 
+# Postmortem failure types: a single mutually-exclusive label assigned to every
+# non-bin episode at the end of the rollout, based on whether the target (and/or a
+# distractor) was ever lifted clear of the table. Unlike the live FAILURE_REASON_*
+# rules above, these are computed once at episode end and apply even when the
+# episode merely timed out without tripping a live failure term.
+POSTMORTEM_NONE = "none"
+POSTMORTEM_NOT_APPLICABLE = "not_applicable"
+POSTMORTEM_SEMANTIC = "semantic"
+POSTMORTEM_FAILED_GRASP = "failed_grasp"
+POSTMORTEM_PLACEMENT = "placement"
+POSTMORTEM_FAILURE_TYPES = (POSTMORTEM_SEMANTIC, POSTMORTEM_FAILED_GRASP, POSTMORTEM_PLACEMENT)
+
 DEFAULT_SUCCESS_CONFIRM_TIME_S = 3.0
 DEFAULT_CONTACT_GRACE_TIME_S = 1.5
+DEFAULT_MOVE_STRAIGHTNESS_FAILURE_CONFIRM_TIME_S = 3.0
+DEFAULT_MOVE_PAST_BOUNDARY_FAILURE_CONFIRM_TIME_S = 3.0
 
 
 @dataclass
@@ -371,6 +386,26 @@ def _confirmation_steps(
     if confirm_steps is not None:
         return confirm_steps
     return max(1, math.ceil(confirm_time_s / _env_step_dt(env)))
+
+
+def _held_failure(
+    env: ManagerBasedRLEnv,
+    counter_attr: str,
+    instant: torch.Tensor,
+    confirm_time_s: float,
+) -> torch.Tensor:
+    """Gate an instantaneous failure mask behind a continuous-hold confirmation window.
+
+    The per-env counter stored on ``env`` as ``counter_attr`` increments while ``instant``
+    is set and resets the moment it clears, so only a deviation that *settles* for the
+    confirmation window -- not a transient swing that recovers -- latches as a failure.
+    """
+    counter = getattr(env, counter_attr, None)
+    if counter is None:
+        counter = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    counter = torch.where(instant, counter + 1, torch.zeros_like(counter))
+    setattr(env, counter_attr, counter)
+    return (counter >= _confirmation_steps(env, confirm_time_s)) & instant
 
 
 def _grasped_object_contact_exceeded_from_counter(
@@ -1575,6 +1610,130 @@ def _ensure_failure_displacement_baseline(
     return env._so101_failure_baseline_recorded
 
 
+def _update_max_object_lift(
+    env: ManagerBasedRLEnv,
+    object_asset_names: list[str],
+    object_pos_w: torch.Tensor,
+    baseline_recorded: torch.Tensor,
+) -> torch.Tensor:
+    """Accumulate, per object, the highest the root has risen above its settled height.
+
+    The settled resting height is the Z stored in ``_so101_failure_object_pos_w`` once
+    the displacement baseline is recorded, so the lift is measured against the object's
+    height after it has stopped dropping onto the table -- not its slightly-elevated
+    spawn pose. Only active objects in envs whose baseline is in are accumulated; the
+    running maximum is what the postmortem classifier later thresholds against.
+    """
+
+    if not hasattr(env, "_so101_max_object_lift"):
+        env._so101_max_object_lift = torch.zeros(
+            (env.num_envs, len(object_asset_names)), dtype=torch.float32, device=env.device
+        )
+    lift = object_pos_w[..., 2] - env._so101_failure_object_pos_w[..., 2]
+    record = baseline_recorded.unsqueeze(1) & _active_mask(env, object_asset_names)
+    env._so101_max_object_lift = torch.where(
+        record,
+        torch.maximum(env._so101_max_object_lift, lift),
+        env._so101_max_object_lift,
+    )
+    return env._so101_max_object_lift
+
+
+@dataclass(frozen=True)
+class PostmortemFailureDiagnostic:
+    """End-of-episode failure classification for one environment."""
+
+    env_id: int
+    task_family: str
+    failure_type: str
+    target_object: str
+    target_lift_m: float
+    lifted_wrong_object: str
+    max_non_target_lift_m: float
+    lift_threshold_m: float
+
+
+def benchmark_postmortem_failure_diagnostics(
+    env: ManagerBasedRLEnv,
+    object_asset_names: list[str],
+    lift_threshold: float = LIFT_OFF_GROUND_LIMIT_M,
+) -> list[PostmortemFailureDiagnostic]:
+    """Classify each non-bin episode into exactly one postmortem failure type.
+
+    The classification is a decision tree over how far each active object was lifted
+    clear of the table during the episode (tracked by :func:`_update_max_object_lift`):
+
+    * the target was lifted >= ``lift_threshold`` -> ``placement`` (the robot grasped
+      the correct object but settled it in the wrong place);
+    * the target was not lifted but some distractor was -> ``semantic`` (the robot
+      lifted the wrong object);
+    * nothing was lifted high enough -> ``failed_grasp``.
+
+    Bin episodes return ``not_applicable`` (the three types are defined for the
+    instruction-following families only). Callers decide whether to keep the label --
+    a confirmed success is not a failure, so the label is only meaningful for episodes
+    that did not succeed.
+    """
+
+    diagnostics: list[PostmortemFailureDiagnostic] = []
+    task_families = getattr(env, "_so101_task_family", None)
+    max_lift = getattr(env, "_so101_max_object_lift", None)
+    active = _active_mask(env, object_asset_names)
+    target_ids = _target_indices(env)
+    for env_id in range(env.num_envs):
+        task_family = task_families[env_id] if task_families is not None else TASK_BIN
+        target_id = int(target_ids[env_id].item())
+        target_object = _debug_object_name(env, object_asset_names, env_id, target_id)
+        if task_family == TASK_BIN or max_lift is None:
+            diagnostics.append(
+                PostmortemFailureDiagnostic(
+                    env_id=env_id,
+                    task_family=task_family,
+                    failure_type=POSTMORTEM_NOT_APPLICABLE if task_family == TASK_BIN else POSTMORTEM_NONE,
+                    target_object=target_object,
+                    target_lift_m=0.0,
+                    lifted_wrong_object="none",
+                    max_non_target_lift_m=0.0,
+                    lift_threshold_m=lift_threshold,
+                )
+            )
+            continue
+
+        target_lift = float(max_lift[env_id, target_id].item())
+        max_non_target_lift = 0.0
+        lifted_wrong_object = "none"
+        for object_id in torch.nonzero(active[env_id], as_tuple=False).flatten().tolist():
+            if object_id == target_id:
+                continue
+            object_lift = float(max_lift[env_id, object_id].item())
+            if object_lift > max_non_target_lift:
+                max_non_target_lift = object_lift
+                if object_lift >= lift_threshold:
+                    lifted_wrong_object = _debug_object_name(env, object_asset_names, env_id, object_id)
+
+        if target_lift >= lift_threshold:
+            failure_type = POSTMORTEM_PLACEMENT
+        elif max_non_target_lift >= lift_threshold:
+            failure_type = POSTMORTEM_SEMANTIC
+        else:
+            failure_type = POSTMORTEM_FAILED_GRASP
+            lifted_wrong_object = "none"
+
+        diagnostics.append(
+            PostmortemFailureDiagnostic(
+                env_id=env_id,
+                task_family=task_family,
+                failure_type=failure_type,
+                target_object=target_object,
+                target_lift_m=target_lift,
+                lifted_wrong_object=lifted_wrong_object,
+                max_non_target_lift_m=max_non_target_lift,
+                lift_threshold_m=lift_threshold,
+            )
+        )
+    return diagnostics
+
+
 def benchmark_failure(
     env: ManagerBasedRLEnv,
     object_asset_names: list[str],
@@ -1590,7 +1749,9 @@ def benchmark_failure(
     non_target_displacement_limit: float = NON_TARGET_DISPLACEMENT_LIMIT_M,
     boundary_displacement_limit: float = BOUNDARY_DISPLACEMENT_LIMIT_M,
     move_straightness_tolerance: float = MOVE_STRAIGHTNESS_TOLERANCE_M,
+    move_straightness_failure_confirm_time_s: float = DEFAULT_MOVE_STRAIGHTNESS_FAILURE_CONFIRM_TIME_S,
     move_past_boundary_tolerance: float = MOVE_PAST_BOUNDARY_TOLERANCE_M,
+    move_past_boundary_failure_confirm_time_s: float = DEFAULT_MOVE_PAST_BOUNDARY_FAILURE_CONFIRM_TIME_S,
     contact_grace_time_s: float = DEFAULT_CONTACT_GRACE_TIME_S,
     min_episode_time_s: float = 5.0,
     displacement_baseline_time_s: float = 1.0,
@@ -1608,6 +1769,7 @@ def benchmark_failure(
 
     if not hasattr(env, "_so101_initial_object_pos_w"):
         env._so101_failure_reasons = [FAILURE_REASON_NONE for _ in range(env.num_envs)]
+        env._so101_postmortem_failure_diagnostics = []
         return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     if table_bounds is None:
         table_bounds = {"x": (0.08, 0.45), "y": (-0.20, 0.20)}
@@ -1632,6 +1794,11 @@ def benchmark_failure(
         bin_name=bin_name,
         baseline_time_s=displacement_baseline_time_s,
     )
+    _update_max_object_lift(env, object_asset_names, object_pos_w, baseline_recorded)
+    # Recomputed every step from the running max lift so that, on the step an episode
+    # ends, the latest classification is already stored before the env auto-resets and
+    # zeros the lift buffer -- mirroring how _so101_failure_reasons survives reset.
+    env._so101_postmortem_failure_diagnostics = benchmark_postmortem_failure_diagnostics(env, object_asset_names)
 
     active = _active_mask(env, object_asset_names)
     # The close that raises a target count to three is still a usable attempt.
@@ -1689,17 +1856,38 @@ def benchmark_failure(
         distance_to_boundary, _progress, lateral, _target = _move_boundary_distance(
             env, object_asset_names, table_bounds, step_state
         )
-        move_past_boundary = (
+        move_task = _task_is(env, TASK_MOVE)
+        # A target driven past its boundary must settle there for the confirmation window
+        # rather than glancing past in mid-flight: only a held, settled overshoot counts as
+        # a failure, mirroring the straightness confirmation below.
+        instant_move_past_boundary = (
             (env._so101_move_boundary_ids >= 0)
             & (distance_to_boundary < -move_past_boundary_tolerance)
-            & _task_is(env, TASK_MOVE)
+            & move_task
         )
-        move_task = _task_is(env, TASK_MOVE)
+        move_past_boundary = _held_failure(
+            env,
+            "_so101_move_past_boundary_failure_counter",
+            instant_move_past_boundary,
+            move_past_boundary_failure_confirm_time_s,
+        )
         # Current (not running-max) deviation: a transient swing that recovers no longer
-        # latches a permanent straightness failure.
-        move_trajectory_not_straight_enough = (
+        # latches a permanent straightness failure. It must be held long enough to
+        # count as a settled bad final position rather than an in-flight detour.
+        instant_move_trajectory_not_straight_enough = (
             lateral > move_straightness_tolerance
         ) & move_task
+        move_trajectory_not_straight_enough = _held_failure(
+            env,
+            "_so101_move_straightness_failure_counter",
+            instant_move_trajectory_not_straight_enough,
+            move_straightness_failure_confirm_time_s,
+        )
+    else:
+        if hasattr(env, "_so101_move_straightness_failure_counter"):
+            env._so101_move_straightness_failure_counter.zero_()
+        if hasattr(env, "_so101_move_past_boundary_failure_counter"):
+            env._so101_move_past_boundary_failure_counter.zero_()
     move_boundary_failure = boundary_moved & _task_is(env, TASK_MOVE)
 
     made_contact = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
@@ -1885,26 +2073,47 @@ def _failure_diagnostics(
         distance_to_boundary, _progress, lateral, _target = _move_boundary_distance(
             env, object_asset_names, table_bounds, step_state
         )
+        past_boundary_counter = getattr(env, "_so101_move_past_boundary_failure_counter", None)
+        if past_boundary_counter is None:
+            past_boundary_counter = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+        past_boundary_required_steps = _confirmation_steps(
+            env,
+            DEFAULT_MOVE_PAST_BOUNDARY_FAILURE_CONFIRM_TIME_S,
+        )
+        past_boundary_instant = boundary_id >= 0 and bool(
+            (distance_to_boundary[env_id] < -MOVE_PAST_BOUNDARY_TOLERANCE_M).item()
+        )
         conditions.append(
             _gated_failure_diagnostic(
                 "move_past_boundary",
-                boundary_id >= 0
-                and bool((distance_to_boundary[env_id] < -MOVE_PAST_BOUNDARY_TOLERANCE_M).item()),
+                past_boundary_instant
+                and int(past_boundary_counter[env_id].item()) >= past_boundary_required_steps,
                 age_ready,
                 baseline_recorded,
                 f"boundary={_debug_boundary_name(env, object_asset_names, env_id, boundary_id)}, "
                 f"distance_to_boundary={float(distance_to_boundary[env_id].item()):.4f}m "
-                f"(failure if <{-MOVE_PAST_BOUNDARY_TOLERANCE_M:.4f}m)",
+                f"(failure if <{-MOVE_PAST_BOUNDARY_TOLERANCE_M:.4f}m), "
+                f"held={int(past_boundary_counter[env_id].item())}/{past_boundary_required_steps} steps",
             )
         )
+        straightness_counter = getattr(env, "_so101_move_straightness_failure_counter", None)
+        if straightness_counter is None:
+            straightness_counter = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+        straightness_required_steps = _confirmation_steps(
+            env,
+            DEFAULT_MOVE_STRAIGHTNESS_FAILURE_CONFIRM_TIME_S,
+        )
+        straightness_instant = bool((lateral[env_id] > move_straightness_tolerance).item())
         conditions.append(
             _gated_failure_diagnostic(
                 "move_trajectory_not_straight_enough",
-                bool((lateral[env_id] > move_straightness_tolerance).item()),
+                straightness_instant
+                and int(straightness_counter[env_id].item()) >= straightness_required_steps,
                 age_ready,
                 baseline_recorded,
                 f"current_lateral_error={float(lateral[env_id].item()):.4f}m "
-                f"(failure if >{move_straightness_tolerance:.4f}m)",
+                f"(failure if >{move_straightness_tolerance:.4f}m), "
+                f"held={int(straightness_counter[env_id].item())}/{straightness_required_steps} steps",
             )
         )
 

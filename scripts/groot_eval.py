@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from datetime import datetime
 import json
 import math
@@ -43,7 +44,7 @@ parser.add_argument(
 )
 parser.add_argument("--policy_host", type=str, default="localhost", help="GR00T policy server host.")
 parser.add_argument("--policy_port", type=int, default=5555, help="GR00T policy server port.")
-parser.add_argument("--action_horizon", type=int, default=8, help="Action steps to execute per server query.")
+parser.add_argument("--action_horizon", type=int, default=16, help="Action steps to execute per server query.")
 parser.add_argument(
     "--initial_hold_time_s",
     type=float,
@@ -325,6 +326,7 @@ from so101_bench.layouts import (
     normalize_layout_object_slots,
 )
 from so101_bench.mdp import benchmark_object_positions, mark_benchmark_robot_start
+from so101_bench.mdp.terminations import POSTMORTEM_FAILURE_TYPES, POSTMORTEM_NOT_APPLICABLE
 from so101_bench.tasks.direct.so101_bench.so101_bench_env_cfg import (
     ASSETS_PATH,
     BIN_RANDOM_POSES,
@@ -1222,6 +1224,8 @@ def main():
     episodes = 0
     successes = 0
     skipped = 0
+    end_reason_counts: Counter[str] = Counter()
+    postmortem_failure_counts: Counter[str] = Counter()
     robot_control_started = False
     snapshot_index = 0
     runtime_controls = _RuntimeControls(
@@ -1256,6 +1260,24 @@ def main():
         evaluated = episodes - skipped
         rate = 100.0 * successes / max(evaluated, 1)
         print(f"[INFO]: Success Rate: {successes}/{evaluated} ({rate:.1f}%), skipped={skipped}")
+        if end_reason_counts:
+            breakdown = ", ".join(
+                f"{reason}={count}" for reason, count in sorted(end_reason_counts.items())
+            )
+            print(f"[INFO]: Episode end reasons: {breakdown}")
+        failures = evaluated - successes
+        if failures > 0:
+            ordered_types = [*POSTMORTEM_FAILURE_TYPES, POSTMORTEM_NOT_APPLICABLE]
+            parts = []
+            for failure_type in ordered_types:
+                count = postmortem_failure_counts.get(failure_type, 0)
+                if count > 0:
+                    parts.append(f"{failure_type}={count} ({100.0 * count / failures:.1f}%)")
+            for failure_type, count in sorted(postmortem_failure_counts.items()):
+                if failure_type not in ordered_types:
+                    parts.append(f"{failure_type}={count} ({100.0 * count / failures:.1f}%)")
+            breakdown = ", ".join(parts) if parts else "none"
+            print(f"[INFO]: Postmortem failure types ({failures} failed episode(s)): {breakdown}")
 
     def _cancel_recording() -> None:
         if recorder is not None:
@@ -1362,14 +1384,39 @@ def main():
             term_log = info.get("log", {})
             is_success = bool(term_log.get("Episode_Termination/success", 0.0) > 0.0)
             end_reason = _episode_end_reason(env, terminated, truncated, term_log)
+            failure_reasons = getattr(env.unwrapped, "_so101_failure_reasons", None)
+            live_failure_reason = failure_reasons[0] if failure_reasons else "none"
             _save_recording()
             episodes += 1
             successes += int(is_success)
+            end_reason_counts[end_reason] += 1
             episode_duration_s = step * control_dt
-            print(
+            message = (
                 f"[INFO]: Episode {episodes}/{episode_count}: success={is_success}, "
                 f"reason={end_reason}, length={episode_duration_s:.2f}s"
             )
+            if not is_success:
+                # Read the classification stored by benchmark_failure on the terminating
+                # step: the env auto-resets inside env.step() and zeros the lift buffer,
+                # so recomputing here would always see a cleared episode.
+                diagnostics = getattr(env.unwrapped, "_so101_postmortem_failure_diagnostics", None)
+                postmortem = diagnostics[0] if diagnostics else None
+                if postmortem is not None and postmortem.failure_type != POSTMORTEM_NOT_APPLICABLE:
+                    postmortem_failure_counts[postmortem.failure_type] += 1
+                    threshold_in = postmortem.lift_threshold_m / INCH
+                    message += (
+                        f", failure_type={postmortem.failure_type}"
+                        f", live_failure_reason={live_failure_reason}"
+                        f" [target={postmortem.target_object}, "
+                        f"target_lift={postmortem.target_lift_m / INCH:.2f}in, "
+                        f"wrong_object={postmortem.lifted_wrong_object}, "
+                        f"max_distractor_lift={postmortem.max_non_target_lift_m / INCH:.2f}in, "
+                        f"lift_threshold={threshold_in:.2f}in]"
+                    )
+                elif postmortem is not None:
+                    postmortem_failure_counts[postmortem.failure_type] += 1
+                    message += f", live_failure_reason={live_failure_reason}"
+            print(message)
 
             if episodes >= episode_count:
                 _print_final_score()

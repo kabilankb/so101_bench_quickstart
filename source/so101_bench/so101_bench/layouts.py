@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import cached_property
 import math
 import random
 from typing import Any
@@ -36,8 +37,8 @@ DEFAULT_BIN_FOOTPRINT_HALF_EXTENTS = (
 )
 DEFAULT_FOOTPRINT_CENTER_OFFSET = (0.0, 0.0)
 DEFAULT_LAYOUT_MAX_ATTEMPTS = 144
-DEFAULT_LAYOUT_CANDIDATES_PER_OBJECT = 64
-DEFAULT_TOP_VALID_LAYOUT_CANDIDATES = 20
+DEFAULT_LAYOUT_CANDIDATES_PER_OBJECT = 48
+DEFAULT_TOP_VALID_LAYOUT_CANDIDATES = 16
 NEXT_TO_FEASIBILITY_YAW_STEPS = 16
 NEXT_TO_FEASIBILITY_ANGLE_STEPS = 32
 NEXT_TO_FEASIBILITY_GAP_FRACTIONS = (0.02, 0.125, 0.25, 0.5, 1.0)
@@ -47,8 +48,10 @@ BETWEEN_FEASIBILITY_OFFSET_STEPS = 10
 BETWEEN_FEASIBILITY_MIN_SEGMENT_FRACTION = 0.18
 BETWEEN_FEASIBILITY_MAX_MIDPOINT_OFFSET_FRACTION = 0.15
 BETWEEN_FEASIBILITY_MIN_TARGET_TRAVEL_M = 3.0 * INCH
-MOVE_FEASIBILITY_MIN_BOUNDARY_GAP_M = 2.5 * INCH
-_DIRECTIONAL_GAP_LATERAL_STEP_M = 0.001
+MOVE_FEASIBILITY_MIN_BOUNDARY_GAP_M = 3.5 * INCH
+_DIRECTIONAL_GAP_LATERAL_STEP_M = 0.005
+_MOVE_BOUNDARY_SUGGESTED_GAP_OFFSETS_M = (0.0, 0.25 * INCH, 0.5 * INCH, 1.0 * INCH)
+_MOVE_BOUNDARY_SUGGESTED_LATERAL_FRACTIONS = (0.0, -0.2, 0.2, -0.4, 0.4)
 _EPS = 1.0e-9
 
 Point2D = tuple[float, float]
@@ -75,7 +78,7 @@ class _PlacedFootprint:
     def radius(self) -> float:
         return math.hypot(self.half_extents[0], self.half_extents[1])
 
-    @property
+    @cached_property
     def move_vertices(self) -> list[Polygon2D]:
         if not self.move_footprint_boxes:
             return [self.vertices]
@@ -1133,6 +1136,11 @@ def _move_direction_vector(direction: str) -> Point2D:
     return (sign, 0.0) if axis == 0 else (0.0, sign)
 
 
+def _piece_vertices_axis_bounds(piece_vertices: list[Polygon2D], axis: int) -> tuple[float, float]:
+    values = [point[axis] for vertices in piece_vertices for point in vertices]
+    return min(values), max(values)
+
+
 def _polygon_cross_section_axis_extents(
     vertices: Polygon2D,
     axis: int,
@@ -1398,6 +1406,153 @@ def _move_boundary_gaps(
     return gaps
 
 
+def _move_boundary_candidate_centers(
+    target: _PlacedFootprint,
+    object_footprint: tuple[Point2D, Point2D] | tuple[Point2D, Point2D, MoveFootprintBoxes],
+    yaw: float,
+    direction: str,
+    min_boundary_gap_m: float,
+) -> list[Point2D]:
+    axis, sign = _move_direction_axis_and_sign(direction)
+    lateral_axis = 1 - axis
+    target_vertices = target.move_vertices
+    target_axis_min, target_axis_max = _piece_vertices_axis_bounds(target_vertices, axis)
+    target_lateral_min, target_lateral_max = _piece_vertices_axis_bounds(target_vertices, lateral_axis)
+    target_front = target_axis_max if sign > 0.0 else target_axis_min
+    target_lateral_center = 0.5 * (target_lateral_min + target_lateral_max)
+    target_lateral_width = target_lateral_max - target_lateral_min
+
+    half_extents, center_offset, move_footprint_boxes = _sampled_object_footprint_parts(object_footprint)
+    if move_footprint_boxes:
+        candidate_vertices = _move_footprint_piece_vertices((0.0, 0.0), yaw, move_footprint_boxes)
+    else:
+        candidate_vertices = [_footprint_vertices((0.0, 0.0), half_extents, center_offset, yaw)]
+    candidate_axis_min, candidate_axis_max = _piece_vertices_axis_bounds(candidate_vertices, axis)
+    candidate_lateral_min, candidate_lateral_max = _piece_vertices_axis_bounds(candidate_vertices, lateral_axis)
+    candidate_near = candidate_axis_min if sign > 0.0 else candidate_axis_max
+    candidate_lateral_center = 0.5 * (candidate_lateral_min + candidate_lateral_max)
+
+    centers: list[Point2D] = []
+    for gap_offset_m in _MOVE_BOUNDARY_SUGGESTED_GAP_OFFSETS_M:
+        desired_near = target_front + sign * (min_boundary_gap_m + gap_offset_m)
+        center_axis = desired_near - candidate_near
+        for lateral_fraction in _MOVE_BOUNDARY_SUGGESTED_LATERAL_FRACTIONS:
+            center = [0.0, 0.0]
+            center[axis] = center_axis
+            center[lateral_axis] = (
+                target_lateral_center
+                + lateral_fraction * target_lateral_width
+                - candidate_lateral_center
+            )
+            centers.append((center[0], center[1]))
+    return centers
+
+
+def _move_target_candidate_centers(
+    object_footprint: tuple[Point2D, Point2D] | tuple[Point2D, Point2D, MoveFootprintBoxes],
+    yaw: float,
+    direction: str,
+    table_bounds: TableBounds,
+    min_boundary_gap_m: float,
+) -> list[Point2D]:
+    axis, sign = _move_direction_axis_and_sign(direction)
+    lateral_axis = 1 - axis
+    half_extents, center_offset, move_footprint_boxes = _sampled_object_footprint_parts(object_footprint)
+    if move_footprint_boxes:
+        target_vertices = _move_footprint_piece_vertices((0.0, 0.0), yaw, move_footprint_boxes)
+    else:
+        target_vertices = [_footprint_vertices((0.0, 0.0), half_extents, center_offset, yaw)]
+
+    target_axis_min, target_axis_max = _piece_vertices_axis_bounds(target_vertices, axis)
+    target_lateral_min, target_lateral_max = _piece_vertices_axis_bounds(target_vertices, lateral_axis)
+    target_front = target_axis_max if sign > 0.0 else target_axis_min
+
+    axis_bounds = table_bounds["x" if axis == 0 else "y"]
+    lateral_bounds = table_bounds["x" if lateral_axis == 0 else "y"]
+    axis_min = float(axis_bounds[0]) - target_axis_min
+    axis_max = float(axis_bounds[1]) - target_axis_max
+    lateral_min = float(lateral_bounds[0]) - target_lateral_min
+    lateral_max = float(lateral_bounds[1]) - target_lateral_max
+    if axis_max < axis_min - _EPS or lateral_max < lateral_min - _EPS:
+        return []
+
+    far_bound = float(axis_bounds[1 if sign > 0.0 else 0])
+    centers: list[Point2D] = []
+    axis_steps = 7
+    lateral_steps = 7
+    for axis_index in range(axis_steps):
+        axis_fraction = 0.5 if axis_steps == 1 else axis_index / (axis_steps - 1)
+        center_axis = axis_min + axis_fraction * (axis_max - axis_min)
+        target_front_world = center_axis + target_front
+        if sign * (far_bound - target_front_world) < min_boundary_gap_m - _EPS:
+            continue
+        for lateral_index in range(lateral_steps):
+            lateral_fraction = 0.5 if lateral_steps == 1 else 0.15 + 0.7 * lateral_index / (lateral_steps - 1)
+            center = [0.0, 0.0]
+            center[axis] = center_axis
+            center[lateral_axis] = lateral_min + lateral_fraction * (lateral_max - lateral_min)
+            centers.append((center[0], center[1]))
+    return centers
+
+
+def _move_candidate_score_adjustment(
+    footprints: list[_PlacedFootprint],
+    target_object_id: int,
+    direction: str,
+    table_bounds: TableBounds,
+    min_boundary_gap_m: float,
+) -> float:
+    footprints_by_id = {footprint.object_id: footprint for footprint in footprints}
+    target = footprints_by_id.get(target_object_id)
+    if target is None:
+        return 0.0
+    if not _table_bounds_contain(target.vertices, table_bounds):
+        return -math.inf
+    if _move_target_forward_table_gap(target, direction, table_bounds) < min_boundary_gap_m - _EPS:
+        return -math.inf
+    clear_path_m = max(min_boundary_gap_m - 1.0e-6, 0.0)
+    if not all(
+        _table_bounds_contain(vertices, table_bounds)
+        for vertices in _move_swept_piece_vertices(target, direction, clear_path_m)
+    ):
+        return -math.inf
+
+    axis, sign = _move_direction_axis_and_sign(direction)
+    lateral_axis = 1 - axis
+    target_vertices = target.move_vertices
+    target_lateral_min, target_lateral_max = _piece_vertices_axis_bounds(target_vertices, lateral_axis)
+    target_lateral_width = target_lateral_max - target_lateral_min
+    min_lateral_overlap_m = MOVE_BOUNDARY_MIN_LATERAL_OVERLAP_FRACTION * target_lateral_width
+    target_axis_min, target_axis_max = _piece_vertices_axis_bounds(target_vertices, axis)
+    target_front = target_axis_max if sign > 0.0 else target_axis_min
+
+    boundary_score = 0.0
+    for object_id, footprint in footprints_by_id.items():
+        if object_id == target_object_id:
+            continue
+        boundary_vertices = footprint.move_vertices
+        boundary_lateral_min, boundary_lateral_max = _piece_vertices_axis_bounds(
+            boundary_vertices,
+            lateral_axis,
+        )
+        lateral_overlap_m = min(target_lateral_max, boundary_lateral_max) - max(
+            target_lateral_min,
+            boundary_lateral_min,
+        )
+        if lateral_overlap_m < min_lateral_overlap_m - _EPS:
+            continue
+        boundary_axis_min, boundary_axis_max = _piece_vertices_axis_bounds(boundary_vertices, axis)
+        boundary_surface = boundary_axis_min if sign > 0.0 else boundary_axis_max
+        boundary_far = boundary_axis_max if sign > 0.0 else boundary_axis_min
+        gap = sign * (boundary_surface - target_front)
+        ahead = sign * (boundary_far - target_front)
+        if gap >= min_boundary_gap_m - _EPS and ahead > _EPS:
+            boundary_score = max(boundary_score, lateral_overlap_m)
+    if boundary_score <= 0.0:
+        return 0.0
+    return 10.0 + boundary_score
+
+
 def _move_feasibility(
     footprints: list[_PlacedFootprint],
     target_object_id: int,
@@ -1420,7 +1575,11 @@ def _move_feasibility(
     boundary_gaps = [
         entry
         for entry in _move_boundary_gaps(target, footprints_by_id, direction)
-        if _table_bounds_contain(footprints_by_id[int(entry["boundary_id"])].vertices, table_bounds)
+        if _table_bounds_contain_fraction(
+            footprints_by_id[int(entry["boundary_id"])].vertices,
+            table_bounds,
+            min_inside_fraction=MIN_INITIAL_TABLE_BOUNDS_INSIDE_FRACTION,
+        )
     ]
     if not boundary_gaps:
         return None
@@ -1777,6 +1936,7 @@ def _sample_spaced_footprints(
     candidate_score_adjustment: CandidateScoreAdjustment | None = None,
     candidate_center_suggestions: CandidateCenterSuggestions | None = None,
     preferred_first_object_id: int | None = None,
+    preferred_placement_order: list[int] | tuple[int, ...] | None = None,
     stop_after_valid_attempts: int | None = None,
     sample_random_valid_layout: bool = False,
     table_bounds: TableBounds | None = None,
@@ -1807,7 +1967,13 @@ def _sample_spaced_footprints(
         attempts_run = attempt
         placement_order = list(base_placement_order)
         rng.shuffle(placement_order)
-        if preferred_first_object_id is not None:
+        if preferred_placement_order is not None:
+            prefix = []
+            for object_id in preferred_placement_order:
+                if object_id in placement_order and object_id not in prefix:
+                    prefix.append(object_id)
+            placement_order = [*prefix, *(object_id for object_id in placement_order if object_id not in prefix)]
+        elif preferred_first_object_id is not None:
             placement_order.remove(preferred_first_object_id)
             placement_order.insert(0, preferred_first_object_id)
         yaws = [rng.uniform(-math.pi, math.pi) for _ in range(count)]
@@ -2067,6 +2233,7 @@ def generate_episode_layout(
         candidate_score_adjustment: CandidateScoreAdjustment | None = None
         candidate_center_suggestions: CandidateCenterSuggestions | None = None
         preferred_first_object_id: int | None = None
+        preferred_placement_order: list[int] | None = None
         stop_after_valid_attempts: int | None = None
         robot_polygon = _xy_polygon(robot_bounding_box) if robot_bounding_box is not None else None
         if episode.task_family == TASK_NEXT_TO:
@@ -2131,6 +2298,49 @@ def generate_episode_layout(
                 )
 
             layout_constraint_name = "move clear path"
+            preferred_first_object_id = target_object_id
+            move_axis, _move_sign = _move_direction_axis_and_sign(direction)
+            boundary_object_id = min(
+                (object_id for object_id in range(len(object_footprints)) if object_id != target_object_id),
+                key=lambda object_id: object_footprints[object_id][0][move_axis],
+            )
+            preferred_placement_order = [target_object_id, boundary_object_id]
+
+            def candidate_center_suggestions(
+                object_id: int,
+                yaw: float,
+                placed: list[_PlacedFootprint],
+            ) -> list[Point2D]:
+                if object_id == target_object_id:
+                    return _move_target_candidate_centers(
+                        object_footprints[object_id],
+                        yaw,
+                        direction,
+                        table_bounds,
+                        move_boundary_gap_m,
+                    )
+                target = next(
+                    (footprint for footprint in placed if footprint.object_id == target_object_id),
+                    None,
+                )
+                if target is None:
+                    return []
+                return _move_boundary_candidate_centers(
+                    target,
+                    object_footprints[object_id],
+                    yaw,
+                    direction,
+                    move_boundary_gap_m,
+                )
+
+            def candidate_score_adjustment(footprints: list[_PlacedFootprint]) -> float:
+                return _move_candidate_score_adjustment(
+                    footprints,
+                    target_object_id,
+                    direction,
+                    table_bounds,
+                    move_boundary_gap_m,
+                )
 
         try:
             if len(episode.objects) == 1:
@@ -2171,10 +2381,13 @@ def generate_episode_layout(
                     candidate_score_adjustment,
                     candidate_center_suggestions,
                     preferred_first_object_id,
+                    preferred_placement_order,
                     stop_after_valid_attempts,
                     sample_random_valid_layout=sample_random_valid_layout,
                     table_bounds=table_bounds,
-                    robot_bounding_box=robot_polygon,
+                    robot_bounding_box=robot_polygon
+                    if episode.task_family in {TASK_NEXT_TO, TASK_BETWEEN}
+                    else None,
                     robot_clearance_m=robot_clearance_m,
                 )
             if len(episode.objects) == 1:
