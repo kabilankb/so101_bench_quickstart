@@ -10,7 +10,7 @@ digital twin of a language-conditioned tabletop manipulation setup with an
 bedroom/tabletop scene, plastic bin, and household objects in simulation so the four
 benchmark tasks can be run, recorded, and scored without hardware.
 
-> The accompanying paper (`27_SO_101_Bench_Measuring_Obje (1).pdf`) reports a
+> The accompanying paper will report a
 > **real-world** study on physical SO-101 hardware. Those real-robot experiments are
 > **not** part of this repository — the figure above and the results below are from
 > the paper, included here as background. What you can run here is the *simulated*
@@ -114,7 +114,7 @@ bedroom/tabletop scene in **Isaac Lab** with scanned object assets so the same
 tasks, arrangements, and instructions can be instantiated in simulation. This
 enables (1) direct real-to-sim correspondence studies and (2) scaling to a much
 larger object set for cheaper, reproducible policy iteration. See the paper
-(`27_SO_101_Bench_Measuring_Obje (1).pdf`) for full details.
+for full details.
 
 ---
 
@@ -245,7 +245,7 @@ codebase. Start it in its own environment, pointing at the downloaded checkpoint
 
 ```bash
 python gr00t/eval/run_gr00t_server.py \
-  --model-path ~/workspace/so101_GR00T_N1.6-3B_WM_v7_50k/checkpoint-50000/ \
+  --model-path ~/workspace/so101_GR00T_N1.6-3B_WM_v7_50k/checkpoint-52000/ \
   --embodiment-tag NEW_EMBODIMENT \
   --device cuda \
   --host 127.0.0.1 \
@@ -256,7 +256,7 @@ python gr00t/eval/run_gr00t_server.py \
 
 Pass a **task file** with `--episodes_jsonl`, an optional **layout file** with
 `--episode_layouts_jsonl`, and add `--record_dataset` to save a LeRobot dataset of
-the rollouts:
+the rollouts (this command uses a reduced subset of the real world tasks/ file):
 
 ```bash
 ~/IsaacLab/isaaclab.sh -p scripts/groot_eval.py \
@@ -319,8 +319,7 @@ and must be downloaded into place. The generated footprint JSONs in
 
 ### Downloading
 
-If you have a hosted assets archive (e.g. on a Hugging Face dataset repo such as
-`5hadytru/so101_bench_assets`), download and extract it into the assets directory:
+Download and extract into the assets directory:
 
 ```bash
 huggingface-cli download 5hadytru/so101_bench_assets so101_bench_usd_assets.tar.gz \
@@ -475,7 +474,7 @@ The same actions are available from the keyboard (`S` start, `C` cancel, `R` ret
 Useful options:
 
 - `--leader follower --follower_port /dev/ttyACM0` — hand-guide a real, torque-off
-  SO-101 follower arm as the leader instead of a gamepad.
+  SO-101 *follower* arm as the leader instead of a gamepad.
 - `--xbox_backend linux --xbox_device /dev/input/js0` — poll a Linux joystick device
   directly; `--xbox_dead_zone` and `--xbox_joint_speed` tune feel.
 - `--auto_record` — start recording automatically when each episode begins.
