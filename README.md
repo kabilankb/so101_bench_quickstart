@@ -2,8 +2,8 @@
 
 **Measuring the Gap Between Semantic and Geometric Competence in Vision-Language-Action Models**
 
-> **Quickstart / Docker distribution.** This is a Dockerized, one-command-launch fork
-> of [`5hadytru/so101_bench`](https://github.com/5hadytru/so101_bench). It adds a
+> **Quickstart / Docker distribution.** This is a Dockerized, one-command-launch
+> distribution of [`5hadytru/so101_bench`](https://github.com/5hadytru/so101_bench). It adds a
 > containerized Isaac Lab + GR00T / MolmoAct2 evaluation setup with the fresh-clone
 > setup fixes baked in, so the digital twin runs without the native environment dance.
 > Jump to [Running in Docker](#running-in-docker), or see
