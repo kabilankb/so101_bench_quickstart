@@ -213,34 +213,107 @@ that renders the scene.
 ## Running in Docker
 
 A containerized Isaac Lab + GR00T setup lives under [`docker/`](docker/) so the demo
-runs without the native environment setup. It bakes in the numpy/lerobot/ffmpeg
-fixes the native install needs, and splits into **two images** because their
-torch/transformers pins conflict:
+runs without the native environment dance. It bakes in the numpy/lerobot/ffmpeg fixes
+the native install needs (see [`SETUP_FIXES.md`](SETUP_FIXES.md)), modeled on NVIDIA's
+[Sim-to-Real-SO-101-Workshop](https://github.com/isaac-sim/Sim-to-Real-SO-101-Workshop)
+`docker/sim` image.
 
-- **`so101-bench`** (`docker/Dockerfile`) — Isaac Lab sim + eval client (smoke tests,
-  teleop, replay, scoring, `groot_eval.py`).
-- **`gr00t-server`** (`docker/gr00t-server/Dockerfile`) — the GR00T-N1.6 policy
-  server on `:5555` (reference image; the checkpoint is mounted, never baked).
+### Prerequisites
 
-`docker/so101.sh` is a one-line dispatcher for the common actions:
+- NVIDIA GPU + recent driver (Blackwell / RTX PRO 6000 supported)
+- [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+- Docker (with `docker compose`)
+- NGC access to pull `nvcr.io/nvidia/isaac-lab` (`docker login nvcr.io`)
+
+> **Version note:** the base image `nvcr.io/nvidia/isaac-lab:2.3.2` must bundle **Isaac
+> Sim 5.1** — this repo's code uses `isaacsim.core.prims` and is validated against 5.1.
+> Override with `--build-arg ISAAC_LAB_IMAGE=...` for a different tag.
+
+### Two images
+
+They are **separate** because their torch/transformers pins conflict — the whole
+reason bringing this up natively was fiddly.
+
+| Image | What it is | Env |
+|-------|-----------|-----|
+| **`so101-bench`** (`docker/Dockerfile`) | Isaac Lab sim + eval client (this repo). Smoke tests, teleop, replay, scoring, `groot_eval.py`. | Isaac Lab / numpy 1.26.4 |
+| **`gr00t-server`** (`docker/gr00t-server/Dockerfile`) | GR00T-N1.6 policy server on `:5555`. *Reference* — needs the checkpoint mounted. | cu128 torch / transformers 4.51.3 |
+
+### Quick commands (`docker/so101.sh`)
+
+One short dispatcher for the common actions:
 
 ```bash
 ./docker/so101.sh build          # build the sim image
 ./docker/so101.sh test           # smoke test: boot Isaac Sim + list envs
 ./docker/so101.sh eval           # run a GR00T eval (server must be up on :5555)
 ./docker/so101.sh shell          # interactive shell in the container
+./docker/so101.sh run <cmd...>   # arbitrary command in the container
 ```
 
-Or bring up the full demo (policy server + sim, wired together) with compose:
+`eval` is overridable via env vars, e.g.:
 
 ```bash
-export GR00T_MODEL=~/workspace/so101_GR00T_N1.6-3B_WM_v7_50k   # dir with checkpoint-52000/
+EPISODES=tasks/red_tape.jsonl NUM_EPISODES=1 REPO_ROOT=data/lerobot/red_tape \
+  ./docker/so101.sh eval
+```
+
+`docker/pick.sh` is an interactive object picker: it lists the objects (grouped by
+split), you choose object(s) + task family, and it writes a task file and launches the
+eval.
+
+### Full demo (compose)
+
+Builds both images, starts the policy server, waits for it to load, then runs a
+5-episode bin eval and records a LeRobot dataset into `./data`:
+
+```bash
+# Point at the directory that contains checkpoint-52000/
+export GR00T_MODEL=~/workspace/so101_GR00T_N1.6-3B_WM_v7_50k
+export HF_TOKEN=hf_...        # optional, for gated asset/model downloads
+
 docker compose -f docker/compose.yaml up --build
 ```
 
-`docker/pick.sh` is an interactive object picker that writes a task file and launches
-the eval. See [`docker/README.md`](docker/README.md) for prerequisites (NVIDIA
-Container Toolkit, NGC access) and the full build/run/eval reference.
+### Sim image only
+
+```bash
+# build (add --build-arg DOWNLOAD_ASSETS=true to bake the ~430 MB USD assets in)
+docker build -t so101-bench:latest -f docker/Dockerfile .
+
+# run an interactive shell, or a specific script
+./docker/run.sh
+./docker/run.sh /workspace/isaaclab/isaaclab.sh -p scripts/list_envs.py
+```
+
+If you did not bake assets, they download from Hugging Face on first run
+(`docker/download_assets.sh`, idempotent). `run.sh` uses `--network=host`, `--gpus
+all`, mounts the Isaac/HF caches, and bind-mounts `tasks/` and `data/` so task files
+and recorded datasets live on the host.
+
+### GR00T server image
+
+```bash
+docker build -t gr00t-server:latest -f docker/gr00t-server/Dockerfile .
+docker run --rm -it --gpus all --network=host \
+  -v ~/workspace/so101_GR00T_N1.6-3B_WM_v7_50k:/models:ro \
+  gr00t-server:latest \
+  --model-path /models/checkpoint-52000 --device cuda --host 0.0.0.0 --port 5555
+```
+
+### What's baked in (and why)
+
+- **`numpy==1.26.4` pinned** — numpy ≥2 breaks Isaac Sim's synthetic-data/camera
+  bindings (`unknown dtype, kind=f, size=0`).
+- **lerobot installed `--no-deps`** under a constraints file — a bare install drags
+  numpy past 2.0.
+- **ffmpeg** — required for LeRobot video (`--record_dataset`).
+- **GR00T server: cu128 torch + transformers 4.51.3** — Blackwell `sm_120` support and
+  the checkpoint's Eagle3-VL `VideoInput` import.
+
+The sim image follows a **proven** NVIDIA workshop pattern; the `gr00t-server` image is
+a **reference** — adjust to your exact Isaac-GR00T checkout / model layout. The
+~10 GB checkpoint is mounted, never baked. Full `docker/` layout:
 
 ```
 docker/
@@ -252,7 +325,7 @@ docker/
   pick.sh                 interactive object picker → task file → eval
   compose.yaml            full demo: gr00t-server + sim wired together
   gr00t-server/Dockerfile  GR00T policy server image (reference)
-  README.md               docker build / run / eval docs
+  README.md               same reference, also rendered in the docker/ subfolder
 ```
 
 ---
