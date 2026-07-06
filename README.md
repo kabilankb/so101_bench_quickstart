@@ -2,6 +2,13 @@
 
 **Measuring the Gap Between Semantic and Geometric Competence in Vision-Language-Action Models**
 
+> **Quickstart / Docker distribution.** This is a Dockerized, one-command-launch fork
+> of [`5hadytru/so101_bench`](https://github.com/5hadytru/so101_bench). It adds a
+> containerized Isaac Lab + GR00T / MolmoAct2 evaluation setup with the fresh-clone
+> setup fixes baked in, so the digital twin runs without the native environment dance.
+> Jump to [Running in Docker](#running-in-docker), or see
+> [`SETUP_FIXES.md`](SETUP_FIXES.md) for the native bring-up worklog.
+
 ![SO-101 Bench tasks, shown on the real robot in the original study](plots/cvpr_two_column_figure.png)
 
 This repository is the **Isaac Lab simulation environment** for SO-101 Bench — a
